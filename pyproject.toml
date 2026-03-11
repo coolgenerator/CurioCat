@@ -1,0 +1,48 @@
+[project]
+name = "curiocat"
+version = "0.1.0"
+description = "CurioCat — Causal Reasoning Engine for Evidence-Based Decisions"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "pgvector",
+    "networkx",
+    "numpy",
+    "openai",
+    "anthropic",
+    "httpx",
+    "sse-starlette",
+    "websockets",
+    "pydantic-settings",
+    "tenacity",
+    "python-dotenv",
+    "python-multipart",
+    "pypdf",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "httpx",
+    "factory-boy",
+]
+
+[tool.setuptools.packages.find]
+include = ["curiocat*"]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

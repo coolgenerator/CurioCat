@@ -1,0 +1,235 @@
+@import "tailwindcss";
+
+@theme {
+  /* Water/ripple color palette - dark-first */
+  --color-ocean-50: #e6f5fa;
+  --color-ocean-100: #b3e0f0;
+  --color-ocean-200: #80cce6;
+  --color-ocean-300: #4db8db;
+  --color-ocean-400: #26a8d4;
+  --color-ocean-500: #0098cc;
+  --color-ocean-600: #007aa3;
+  --color-ocean-700: #005c7a;
+  --color-ocean-800: #003d52;
+  --color-ocean-900: #001f29;
+
+  --color-deep-50: #e8eaf5;
+  --color-deep-100: #b8bfe0;
+  --color-deep-200: #8894cb;
+  --color-deep-300: #5869b6;
+  --color-deep-400: #3549a6;
+  --color-deep-500: #1a2f8a;
+  --color-deep-600: #15266e;
+  --color-deep-700: #101c53;
+  --color-deep-800: #0b1337;
+  --color-deep-900: #06091c;
+
+  --color-amber-50: #fff8e1;
+  --color-amber-100: #ffecb3;
+  --color-amber-200: #ffe082;
+  --color-amber-300: #ffd54f;
+  --color-amber-400: #ffca28;
+  --color-amber-500: #ffc107;
+  --color-amber-600: #ffb300;
+  --color-amber-700: #ff8f00;
+  --color-amber-800: #ff6f00;
+  --color-amber-900: #e65100;
+
+  /* Semantic colors */
+  --color-confidence-high: #22c55e;
+  --color-confidence-medium: #eab308;
+  --color-confidence-low: #ef4444;
+  --color-evidence-supporting: #3b82f6;
+  --color-evidence-contested: #f97316;
+  --color-evidence-none: #6b7280;
+
+  /* Surface colors — dark theme defaults */
+  --color-surface-900: #0a0e1a;
+  --color-surface-800: #111827;
+  --color-surface-700: #1e293b;
+  --color-surface-600: #334155;
+  --color-surface-500: #475569;
+
+  --color-text-primary: #f1f5f9;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+}
+
+/* Light theme overrides */
+[data-theme="light"] {
+  --color-surface-900: #f1f5f9;
+  --color-surface-800: #ffffff;
+  --color-surface-700: #f1f5f9;
+  --color-surface-600: #e2e8f0;
+  --color-surface-500: #cbd5e1;
+
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+
+  --color-ocean-400: #0284c7;
+  --color-ocean-500: #0369a1;
+}
+
+/* Graph canvas theme tokens — consumed by D3 and MiniMap via getComputedStyle */
+:root {
+  --graph-node-fill: rgba(30, 41, 59, 0.65);
+  --graph-node-text: #f1f5f9;
+  --graph-collapse-fill: #1e293b;
+  --graph-collapse-stroke: #475569;
+  --graph-collapse-text: #94a3b8;
+  --graph-convergence-stroke: #1e1b4b;
+  --graph-edge-dimmed: #334155;
+  --graph-minimap-bg: rgba(17, 24, 39, 0.85);
+  --graph-minimap-edge: rgba(71, 85, 105, 0.4);
+  --graph-minimap-node: #64748b;
+}
+[data-theme="light"] {
+  --graph-node-fill: rgba(241, 245, 249, 0.85);
+  --graph-node-text: #1e293b;
+  --graph-collapse-fill: #e2e8f0;
+  --graph-collapse-stroke: #cbd5e1;
+  --graph-collapse-text: #475569;
+  --graph-convergence-stroke: #c4b5fd;
+  --graph-edge-dimmed: #cbd5e1;
+  --graph-minimap-bg: rgba(241, 245, 249, 0.9);
+  --graph-minimap-edge: rgba(148, 163, 184, 0.5);
+  --graph-minimap-node: #64748b;
+}
+
+/* Light-mode overrides for D3 graph elements (inline styles) */
+[data-theme="light"] .graph-root foreignObject div {
+  color: var(--graph-node-text) !important;
+}
+[data-theme="light"] .graph-root foreignObject div span {
+  color: inherit;
+}
+[data-theme="light"] .graph-root text {
+  fill: #334155;
+}
+[data-theme="light"] .graph-root .node-rect {
+  stroke-width: 1.8;
+}
+[data-theme="light"] .graph-root .bundle-badge rect {
+  fill: #e2e8f0;
+  stroke: #cbd5e1;
+}
+[data-theme="light"] .graph-root .bundle-badge text {
+  fill: #334155;
+}
+
+body {
+  @apply bg-surface-900 text-text-primary antialiased;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Side panel slide-in animation */
+@keyframes slide-in-from-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in-from-right 0.25s ease-out;
+}
+
+/* D3 edge particle animation */
+@keyframes dash {
+  to {
+    stroke-dashoffset: -40;
+  }
+}
+
+/* Bottom sheet animation for mobile panels */
+@keyframes slide-up-from-bottom {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* On mobile, side panels become bottom sheets */
+@media (max-width: 767px) {
+  .animate-slide-in {
+    animation: slide-up-from-bottom 0.3s ease-out;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100% !important;
+    max-height: 60vh;
+    border-top-left-radius: 1rem;
+    border-top-right-radius: 1rem;
+    z-index: 40;
+  }
+}
+
+/* Touch-friendly tap targets on mobile */
+@media (max-width: 767px) {
+  button, a, [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* Ocean gradient spinner */
+@keyframes ocean-spin {
+  0% { border-color: #0098cc transparent #26a8d4 transparent; }
+  50% { border-color: #26a8d4 transparent #0098cc transparent; }
+  100% { border-color: #0098cc transparent #26a8d4 transparent; }
+}
+
+/* Tooltip fade+scale in */
+@keyframes tooltip-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Edge icon warning pulse */
+@keyframes warn-pulse {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.45; }
+}
+
+.animate-warn-pulse {
+  animation: warn-pulse 2s ease-in-out infinite;
+}
+
+/* Drag handle for resizable panels */
+.drag-handle {
+  background: transparent;
+  transition: background-color 0.15s ease;
+}
+
+.drag-handle:hover {
+  background-color: var(--color-ocean-500);
+  opacity: 0.4;
+}
+
+.drag-handle--active {
+  background-color: var(--color-ocean-500) !important;
+  opacity: 0.7 !important;
+}
+
+/* On mobile, hide left sidebar (claims browser) */
+@media (max-width: 767px) {
+  [data-panel-side="left"] {
+    display: none;
+  }
+}
