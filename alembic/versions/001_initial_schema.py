@@ -67,6 +67,7 @@ def upgrade() -> None:
         sa.Column("order_index", sa.Integer(), nullable=False),
         sa.Column("layer", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("source_sentence", sa.Text(), nullable=True),
+        sa.Column("logic_gate", sa.String(10), nullable=False, server_default="or"),
     )
 
     # Create causal_edge table
@@ -101,6 +102,11 @@ def upgrade() -> None:
         sa.Column(
             "evidence_score", sa.Float(), nullable=False, server_default="0.5"
         ),
+        sa.Column("causal_type", sa.String(50), nullable=False, server_default="direct"),
+        sa.Column("condition_type", sa.String(50), nullable=False, server_default="contributing"),
+        sa.Column("temporal_window", sa.String(100), nullable=True),
+        sa.Column("decay_type", sa.String(50), nullable=False, server_default="none"),
+        sa.Column("bias_warnings", sa.JSON(), nullable=True),
     )
 
     # Create evidence table
@@ -130,6 +136,9 @@ def upgrade() -> None:
         sa.Column("snippet", sa.Text(), nullable=False),
         sa.Column("relevance_score", sa.Float(), nullable=False),
         sa.Column("credibility_score", sa.Float(), nullable=False),
+        sa.Column("source_tier", sa.Integer(), nullable=False, server_default="4"),
+        sa.Column("published_date", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("freshness_score", sa.Float(), nullable=False, server_default="0.5"),
     )
 
     # Create scenario table
