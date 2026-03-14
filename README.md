@@ -18,6 +18,12 @@ CurioCat is an AI-powered decision intelligence tool that makes causal reasoning
 
 Instead of trusting black-box predictions, you see *why* one thing leads to another, *how strong* the evidence is, and *what happens if* your assumptions change. Every link in the reasoning chain is transparent, adjustable, and backed by sources — turning information overload into structured insight for better decisions.
 
+## Screenshots
+
+![Main Screen](static/screenshot/curiocat_en_main.png)
+![Causal Graph](static/screenshot/curiocat_en_graph_basic.png)
+![Focus Mode](static/screenshot/curiocat_en_graph_focus.png)
+
 ## How It Works
 
 CurioCat processes input through a multi-layer pipeline:
