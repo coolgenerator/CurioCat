@@ -61,7 +61,13 @@ class EdgeResponse(BaseModel):
     bias_warnings: list[dict] = []
     consensus_level: str = "insufficient"
     sensitivity: float | None = None
+    is_feedback: bool = False
     evidences: list[EvidenceResponse] = []
+    statistical_validation: str | None = None  # confirmed, unsupported, contradicted, not_tested
+    stat_p_value: float | None = None
+    stat_f_statistic: float | None = None
+    stat_effect_size: float | None = None
+    stat_lag: int | None = None
 
 
 class GraphResponse(BaseModel):

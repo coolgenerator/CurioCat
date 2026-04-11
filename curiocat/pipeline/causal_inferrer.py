@@ -1,8 +1,8 @@
 """Stage 2: Causal Link Inference.
 
-Uses a two-pass approach: first filters candidate claim pairs by embedding
-cosine similarity, then calls the LLM to judge causal relationships for
-each candidate pair.
+Uses a BFS-style approach for initial inference (O(n) LLM calls instead of
+O(n²) pairwise), and falls back to pairwise for incremental inference of
+newly discovered claims.
 """
 
 from __future__ import annotations
@@ -17,6 +17,10 @@ from curiocat.exceptions import PipelineError
 from curiocat.llm.client import LLMClient
 from curiocat.llm.prompts import language_instruction
 from curiocat.llm.prompts.causal_inference import (
+    BFS_EXPANSION_SCHEMA,
+    BFS_EXPANSION_SYSTEM,
+    BFS_ROOT_IDENTIFICATION_SCHEMA,
+    BFS_ROOT_IDENTIFICATION_SYSTEM,
     CAUSAL_INFERENCE_SCHEMA,
     CAUSAL_INFERENCE_SYSTEM,
 )
@@ -28,78 +32,143 @@ logger = logging.getLogger(__name__)
 _SIMILARITY_THRESHOLD = 0.3
 
 # Maximum concurrent LLM calls for causal inference
-_MAX_CONCURRENT_LLM_CALLS = 5
+_MAX_CONCURRENT_LLM_CALLS = 10
+
+# Maximum candidate targets per source node (top-K by similarity)
+_MAX_CANDIDATES_PER_NODE = 10
 
 
 class CausalInferrer:
-    """Infers causal relationships between claims using embedding similarity
-    filtering followed by LLM-based judgment.
+    """Infers causal relationships between claims.
+
+    Primary method: BFS-style O(n) inference.
+    Fallback: Pairwise O(n²) for incremental inference.
     """
 
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
 
     async def infer(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Infer causal links between the provided claims.
+        """Infer causal links using BFS-style approach.
 
-        Pass 1: Build a cosine similarity matrix from claim embeddings using
-        numpy. Filter pairs where similarity > 0.3 as candidate pairs.
+        1. Identify root causes (claims not caused by others).
+        2. For each claim, ask the LLM "what does this cause?" in one call.
+        3. Build edges from the results, with cycle detection.
 
-        Pass 2: For each candidate pair, call the LLM to judge whether a
-        causal relationship exists. Concurrent calls are limited by a
-        semaphore.
+        This reduces LLM calls from O(n²) pairwise to O(n).
 
         Args:
-            claims: List of claim dicts, each with "text", "type",
-                "confidence", "embedding", and "order_index" keys.
+            claims: List of claim dicts with "text", "type", "confidence",
+                "embedding", and "order_index" keys.
 
         Returns:
-            A list of edge dicts for confirmed causal links, each containing:
-              - source_idx (int): Index into the claims list for the cause.
-              - target_idx (int): Index into the claims list for the effect.
-              - mechanism (str): Description of the causal mechanism.
-              - strength (float): Causal strength, 0.0 to 1.0.
-              - time_delay (str): Estimated time between cause and effect.
-              - conditions (list[str]): Conditions for the link to hold.
-              - reversible (bool): Whether the effect is reversible.
-
-        Raises:
-            PipelineError: If causal inference fails.
+            A list of edge dicts for confirmed causal links.
         """
         if len(claims) < 2:
             logger.info("Fewer than 2 claims; no causal inference needed")
             return []
 
-        # Pass 1: Build cosine similarity matrix and find candidate pairs
-        candidate_pairs = self._find_candidate_pairs(claims)
-        logger.info(
-            "Found %d candidate pairs from %d claims (similarity > %.2f)",
-            len(candidate_pairs),
-            len(claims),
-            _SIMILARITY_THRESHOLD,
-        )
+        # Step 1: Identify root causes
+        root_indices = await self._identify_roots(claims)
+        logger.info("BFS: identified %d root causes from %d claims", len(root_indices), len(claims))
 
-        if not candidate_pairs:
-            logger.info("No candidate pairs above similarity threshold")
-            return []
+        if not root_indices:
+            # Fallback: treat all claims as potential roots
+            root_indices = list(range(len(claims)))
 
-        # Pass 2: LLM-based causal judgment for each candidate pair
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
-        tasks = [
-            self._judge_pair(claims, i, j, semaphore)
-            for i, j in candidate_pairs
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
+        # Step 2: BFS expansion — for each claim, find what it causes
+        # Use embedding similarity to pre-filter candidates per source
         edges: list[dict[str, Any]] = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning("Causal inference failed for a pair: %s", result)
-                continue
-            if result is not None:
-                edges.append(result)
+        visited_edges: set[tuple[int, int]] = set()
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
 
-        logger.info("Confirmed %d causal edges", len(edges))
+        # BFS queue: start from roots, expand layer by layer
+        queue = list(root_indices)
+        visited_nodes: set[int] = set()
+
+        while queue:
+            # Process current layer in parallel
+            tasks = []
+            for source_idx in queue:
+                if source_idx in visited_nodes:
+                    continue
+                visited_nodes.add(source_idx)
+                # Find candidate targets using embedding similarity
+                candidates = self._find_candidates_for_source(
+                    claims, source_idx
+                )
+                if candidates:
+                    tasks.append(
+                        self._expand_node(
+                            claims, source_idx, candidates,
+                            semaphore, visited_edges,
+                        )
+                    )
+
+            if not tasks:
+                break
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            next_queue: list[int] = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("BFS expansion failed: %s", result)
+                    continue
+                for edge in result:
+                    edges.append(edge)
+                    target_idx = edge["target_idx"]
+                    if target_idx not in visited_nodes:
+                        next_queue.append(target_idx)
+
+            queue = next_queue
+
+        # Step 3: Expand any unvisited nodes — BFS from roots may miss
+        # claims that are not reachable from root causes but still have
+        # causal relationships among themselves.
+        unvisited = [i for i in range(len(claims)) if i not in visited_nodes]
+        if unvisited:
+            logger.info(
+                "BFS: expanding %d unvisited nodes after root BFS", len(unvisited)
+            )
+            tasks = []
+            for source_idx in unvisited:
+                visited_nodes.add(source_idx)
+                candidates = self._find_candidates_for_source(
+                    claims, source_idx
+                )
+                if candidates:
+                    tasks.append(
+                        self._expand_node(
+                            claims, source_idx, candidates,
+                            semaphore, visited_edges,
+                        )
+                    )
+
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning("BFS expansion failed: %s", result)
+                        continue
+                    edges.extend(result)
+
+        # Dynamic edge budget: keep the graph readable and evidence
+        # grounding affordable.  Target roughly 2× the claim count so
+        # that a 25-claim graph yields ≤50 edges, not 100+.
+        max_edges = max(10, len(claims) * 2)
+
+        if len(edges) > max_edges:
+            # Keep the strongest edges
+            edges.sort(key=lambda e: e.get("strength", 0), reverse=True)
+            dropped = len(edges) - max_edges
+            edges = edges[:max_edges]
+            logger.info(
+                "BFS: pruned %d weak edges to stay within budget (%d edges for %d claims)",
+                dropped, max_edges, len(claims),
+            )
+
+        logger.info("BFS: confirmed %d causal edges from %d claims", len(edges), len(claims))
         return edges
 
     async def infer_incremental(
@@ -109,9 +178,8 @@ class CausalInferrer:
     ) -> list[dict[str, Any]]:
         """Infer causal links involving at least one new claim.
 
-        Instead of O(n^2) over all claims, only checks pairs (i, j) where
-        i in new_claim_indices OR j in new_claim_indices.
-        Uses the same similarity filtering + LLM judgment pipeline.
+        Uses pairwise approach for incremental inference since only a small
+        number of new claims are added at a time.
 
         Args:
             all_claims: The full list of claims (existing + new).
@@ -155,6 +223,148 @@ class CausalInferrer:
         logger.info("Incremental inference confirmed %d new edges", len(edges))
         return edges
 
+    # --- BFS methods ---
+
+    async def _identify_roots(
+        self, claims: list[dict[str, Any]]
+    ) -> list[int]:
+        """Ask the LLM to identify root cause claims."""
+        claims_text = "\n".join(
+            f"[{i}] {c['text']}" for i, c in enumerate(claims)
+        )
+        user_prompt = (
+            f"Identify root causes from these claims:\n\n{claims_text}"
+            f"{language_instruction(claims[0]['text'])}"
+        )
+
+        try:
+            result = await self._llm.complete_json(
+                system=BFS_ROOT_IDENTIFICATION_SYSTEM,
+                user=user_prompt,
+                schema=BFS_ROOT_IDENTIFICATION_SCHEMA,
+            )
+        except Exception as exc:
+            logger.warning("Root identification failed: %s", exc)
+            return list(range(len(claims)))
+
+        indices = result.get("root_indices", [])
+        # Validate indices are in range
+        valid = [i for i in indices if 0 <= i < len(claims)]
+        return valid if valid else list(range(len(claims)))
+
+    def _find_candidates_for_source(
+        self,
+        claims: list[dict[str, Any]],
+        source_idx: int,
+    ) -> list[int]:
+        """Find candidate target claims using embedding similarity.
+
+        Returns at most _MAX_CANDIDATES_PER_NODE candidates, sorted by
+        descending similarity, to keep LLM prompts short and fast.
+        """
+        source_emb = np.array(claims[source_idx]["embedding"])
+        source_norm = np.linalg.norm(source_emb)
+        if source_norm == 0:
+            return []
+
+        scored: list[tuple[int, float]] = []
+        for j, claim in enumerate(claims):
+            if j == source_idx:
+                continue
+            target_emb = np.array(claim["embedding"])
+            target_norm = np.linalg.norm(target_emb)
+            if target_norm == 0:
+                continue
+            sim = float(np.dot(source_emb, target_emb) / (source_norm * target_norm))
+            if sim > _SIMILARITY_THRESHOLD:
+                scored.append((j, sim))
+
+        # Sort by similarity descending, keep top-K
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [idx for idx, _ in scored[:_MAX_CANDIDATES_PER_NODE]]
+
+    async def _expand_node(
+        self,
+        claims: list[dict[str, Any]],
+        source_idx: int,
+        candidate_indices: list[int],
+        semaphore: asyncio.Semaphore,
+        visited_edges: set[tuple[int, int]],
+    ) -> list[dict[str, Any]]:
+        """Expand a single node: ask LLM what it causes among candidates.
+
+        One LLM call returns all causal links from this source.
+        """
+        async with semaphore:
+            source_claim = claims[source_idx]
+
+            # Build candidate list for the prompt
+            candidates_text = "\n".join(
+                f"[{idx}] {claims[ci]['text']}"
+                for idx, ci in enumerate(candidate_indices)
+            )
+
+            user_prompt = (
+                f"SOURCE CLAIM: {source_claim['text']}\n\n"
+                f"CANDIDATE CLAIMS:\n{candidates_text}"
+                f"{language_instruction(source_claim['text'])}"
+            )
+
+            try:
+                result = await self._llm.complete_json(
+                    system=BFS_EXPANSION_SYSTEM,
+                    user=user_prompt,
+                    schema=BFS_EXPANSION_SCHEMA,
+                )
+            except Exception as exc:
+                raise PipelineError(
+                    f"BFS expansion failed for claim [{source_idx}]: {exc}"
+                ) from exc
+
+            edges: list[dict[str, Any]] = []
+            for caused in result.get("caused_claims", []):
+                local_target_idx = caused.get("target_index")
+                if local_target_idx is None or local_target_idx < 0 or local_target_idx >= len(candidate_indices):
+                    continue
+
+                # Map local index back to global claim index
+                global_target_idx = candidate_indices[local_target_idx]
+                edge_key = (source_idx, global_target_idx)
+
+                # Cycle detection: skip if this edge already exists
+                if edge_key in visited_edges:
+                    continue
+                visited_edges.add(edge_key)
+
+                mechanism = caused.get("mechanism", "")
+                # Validate mechanism
+                validated = validate_causal_output(
+                    {"mechanism": mechanism, "strength": caused.get("strength", 0.5)},
+                    source_claim["text"],
+                    claims[global_target_idx]["text"],
+                )
+                if validated is None:
+                    continue
+
+                edges.append({
+                    "source_idx": source_idx,
+                    "target_idx": global_target_idx,
+                    "mechanism": mechanism,
+                    "strength": validated["strength"],
+                    "time_delay": caused.get("time_delay"),
+                    "conditions": [],
+                    "reversible": False,
+                    "direction": "source_to_target",
+                    "causal_type": caused.get("causal_type", "direct"),
+                    "condition_type": "contributing",
+                    "temporal_window": None,
+                    "decay_type": "none",
+                })
+
+            return edges
+
+    # --- Pairwise methods (used for incremental inference) ---
+
     def _find_incremental_candidate_pairs(
         self,
         claims: list[dict[str, Any]],
@@ -180,39 +390,6 @@ class CausalInferrer:
 
         return pairs
 
-    def _find_candidate_pairs(
-        self, claims: list[dict[str, Any]]
-    ) -> list[tuple[int, int]]:
-        """Build cosine similarity matrix and return pairs above threshold.
-
-        Args:
-            claims: List of claim dicts with "embedding" keys.
-
-        Returns:
-            List of (i, j) tuples where i < j and cosine similarity > threshold.
-        """
-        embeddings = np.array([c["embedding"] for c in claims])
-
-        # Compute pairwise cosine similarity matrix efficiently
-        # Normalize rows to unit length
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        # Avoid division by zero
-        norms = np.where(norms == 0, 1.0, norms)
-        normalized = embeddings / norms
-
-        # Similarity matrix via dot product of normalized vectors
-        similarity_matrix = normalized @ normalized.T
-
-        # Extract candidate pairs (upper triangle only, no self-pairs)
-        pairs: list[tuple[int, int]] = []
-        n = len(claims)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if similarity_matrix[i, j] > _SIMILARITY_THRESHOLD:
-                    pairs.append((i, j))
-
-        return pairs
-
     async def _judge_pair(
         self,
         claims: list[dict[str, Any]],
@@ -220,20 +397,7 @@ class CausalInferrer:
         j: int,
         semaphore: asyncio.Semaphore,
     ) -> dict[str, Any] | None:
-        """Call the LLM to judge whether a causal link exists between two claims.
-
-        Args:
-            claims: The full list of claims.
-            i: Index of claim A.
-            j: Index of claim B.
-            semaphore: Concurrency limiter.
-
-        Returns:
-            An edge dict if a causal link is found, or None otherwise.
-
-        Raises:
-            PipelineError: If the LLM call fails.
-        """
+        """Call the LLM to judge whether a causal link exists between two claims."""
         async with semaphore:
             claim_a = claims[i]
             claim_b = claims[j]
@@ -277,8 +441,6 @@ class CausalInferrer:
             elif direction == "target_to_source":
                 source_idx, target_idx = j, i
             elif direction == "bidirectional":
-                # For bidirectional, we still pick a primary direction (A -> B)
-                # and note it. The graph layer can handle this if needed.
                 source_idx, target_idx = i, j
             else:
                 return None

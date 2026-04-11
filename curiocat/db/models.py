@@ -29,6 +29,10 @@ class Project(Base):
     has_temporal: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true"
     )
+    last_completed_stage: Mapped[str | None] = mapped_column(
+        String(50), nullable=True,
+        comment="Checkpoint for pipeline resume: claim_extraction, causal_inference, bias_audit, evidence_grounding, dag_construction, belief_propagation",
+    )
 
     # Relationships
     claims: Mapped[list["Claim"]] = relationship(
@@ -56,7 +60,7 @@ class Claim(Base):
         String(50), comment="FACT, ASSUMPTION, PREDICTION, or OPINION"
     )
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
-    embedding = mapped_column(Vector(1536), nullable=True)
+    embedding = mapped_column(Vector(1024), nullable=True)
     metadata_: Mapped[dict | None] = mapped_column(
         "metadata", JSON, nullable=True
     )
@@ -86,15 +90,26 @@ class CausalEdge(Base):
     )
     mechanism: Mapped[str] = mapped_column(Text)
     strength: Mapped[float] = mapped_column(Float, comment="0.0 to 1.0")
-    time_delay: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    time_delay: Mapped[str | None] = mapped_column(Text, nullable=True)
     conditions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     reversible: Mapped[bool] = mapped_column(Boolean, default=False)
     evidence_score: Mapped[float] = mapped_column(Float, default=0.5)
     causal_type: Mapped[str] = mapped_column(String(50), default="direct")
     condition_type: Mapped[str] = mapped_column(String(50), default="contributing")
-    temporal_window: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    temporal_window: Mapped[str | None] = mapped_column(Text, nullable=True)
     decay_type: Mapped[str] = mapped_column(String(50), default="none")
     bias_warnings = mapped_column(JSON, nullable=True)
+    is_feedback: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+    # Statistical validation (populated by StatisticalValidator stage)
+    statistical_validation: Mapped[str | None] = mapped_column(
+        String(20), nullable=True,
+        comment="confirmed, unsupported, contradicted, or not_tested",
+    )
+    stat_p_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stat_f_statistic: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stat_effect_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stat_lag: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Relationships
     project: Mapped["Project"] = relationship(back_populates="edges")
@@ -117,8 +132,8 @@ class Evidence(Base):
     evidence_type: Mapped[str] = mapped_column(
         String(50), comment="supporting or contradicting"
     )
-    source_url: Mapped[str] = mapped_column(String(2048))
-    source_title: Mapped[str] = mapped_column(String(500))
+    source_url: Mapped[str] = mapped_column(Text)
+    source_title: Mapped[str] = mapped_column(Text)
     source_type: Mapped[str] = mapped_column(
         String(50), comment="academic, news, blog, forum, or other"
     )
@@ -164,3 +179,89 @@ class Scenario(Base):
     parent: Mapped["Scenario | None"] = relationship(
         remote_side=[id], foreign_keys=[parent_scenario_id]
     )
+
+
+# --------------------------------------------------------------------------
+# Three-Layer Causal Analysis Models
+# --------------------------------------------------------------------------
+
+class MultiLayerEvidence(Base):
+    """Multi-layer causal evidence. Each row is one piece of evidence for a
+    causal relationship produced by a specific layer/algorithm."""
+
+    __tablename__ = "multi_layer_evidence"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE"), nullable=True
+    )
+    source_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("claim.id", ondelete="SET NULL"), nullable=True
+    )
+    target_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("claim.id", ondelete="SET NULL"), nullable=True
+    )
+    source_label: Mapped[str] = mapped_column(String(500))
+    target_label: Mapped[str] = mapped_column(String(500))
+
+    # Which layer / algorithm
+    layer: Mapped[int] = mapped_column(Integer)  # 1=LLM, 2=monitoring, 3=statistical
+    algorithm: Mapped[str] = mapped_column(String(50))  # "llm", "granger", "pc", "fci", "pcmci"
+
+    # Edge semantics
+    edge_type: Mapped[str] = mapped_column(String(30), default="directed")
+    lag: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Confidence & statistics
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    p_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    effect_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Context
+    data_type: Mapped[str] = mapped_column(String(30), default="unknown")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    source_claim: Mapped["Claim | None"] = relationship(foreign_keys=[source_claim_id])
+    target_claim: Mapped["Claim | None"] = relationship(foreign_keys=[target_claim_id])
+
+
+class EventTimeline(Base):
+    """PM intervention or external events for causal timeline tracking."""
+
+    __tablename__ = "event_timeline"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE"), nullable=True
+    )
+    title: Mapped[str] = mapped_column(String(500))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_type: Mapped[str] = mapped_column(String(30))  # pricing, feature, campaign, external, bug, other
+    event_date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(20), default="manual")  # manual, chat_extracted, api_detected
+    affected_metrics: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    evidence_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MetricSeries(Base):
+    """Time-series metric data from CSV/Excel/screenshot uploads."""
+
+    __tablename__ = "metric_series"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(500))
+    unit: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    frequency: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    data_points: Mapped[dict] = mapped_column(JSON)
+    source_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

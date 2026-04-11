@@ -59,6 +59,9 @@ def _build_nx_graph(
         )
 
     for edge in edges:
+        # Skip feedback edges — they must not participate in belief propagation
+        if getattr(edge, "is_feedback", False):
+            continue
         g.add_edge(
             str(edge.source_claim_id),
             str(edge.target_claim_id),
@@ -198,7 +201,13 @@ def _assemble_graph_response(
                 bias_warnings=getattr(edge, "bias_warnings", None) or [],
                 consensus_level=consensus,
                 sensitivity=edge_sensitivities.get(edge_key),
+                is_feedback=getattr(edge, "is_feedback", False),
                 evidences=evidence_list,
+                statistical_validation=getattr(edge, "statistical_validation", None),
+                stat_p_value=getattr(edge, "stat_p_value", None),
+                stat_f_statistic=getattr(edge, "stat_f_statistic", None),
+                stat_effect_size=getattr(edge, "stat_effect_size", None),
+                stat_lag=getattr(edge, "stat_lag", None),
             )
         )
 
@@ -343,7 +352,13 @@ async def update_edge(
         temporal_window=getattr(edge, "temporal_window", None),
         decay_type=getattr(edge, "decay_type", "none") or "none",
         bias_warnings=getattr(edge, "bias_warnings", None) or [],
+        is_feedback=getattr(edge, "is_feedback", False),
         evidences=evidence_list,
+        statistical_validation=getattr(edge, "statistical_validation", None),
+        stat_p_value=getattr(edge, "stat_p_value", None),
+        stat_f_statistic=getattr(edge, "stat_f_statistic", None),
+        stat_effect_size=getattr(edge, "stat_effect_size", None),
+        stat_lag=getattr(edge, "stat_lag", None),
     )
 
 

@@ -1,4 +1,91 @@
-"""Prompts and schemas for Stage 2: Causal Link Inference."""
+"""Prompts and schemas for Stage 2: Causal Link Inference.
+
+Provides both pairwise prompts (legacy) and BFS-style prompts that reduce
+LLM calls from O(n²) to O(n) by asking each claim to identify all its
+effects in one call.
+"""
+
+# --- BFS-style prompts (one-to-many, O(n) calls) ---
+
+BFS_ROOT_IDENTIFICATION_SYSTEM = """\
+You are an expert in causal reasoning. Given a list of claims, identify which \
+claims are ROOT CAUSES — claims that are not caused by any other claim in the list.
+
+A root cause is an exogenous factor, an initial condition, or an independent \
+variable that drives other claims but is not itself driven by them.
+
+Return the indices of the root cause claims."""
+
+BFS_ROOT_IDENTIFICATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "root_indices": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": "Indices of claims that are root causes.",
+        },
+    },
+    "required": ["root_indices"],
+    "additionalProperties": False,
+}
+
+BFS_EXPANSION_SYSTEM = """\
+You are an expert in causal reasoning. Given a SOURCE CLAIM and a list of \
+CANDIDATE CLAIMS, identify which candidates the source CAUSES or ENABLES.
+
+For each causal link found, provide:
+- target_index: index of the candidate claim in the list
+- mechanism: specific causal mechanism (1-2 sentences)
+- strength: 0.0-1.0 (how strong the causal connection is)
+- causal_type: "direct", "indirect", "probabilistic", "enabling", "inhibiting", or "triggering"
+- time_delay: estimated time between cause and effect
+
+Be rigorous. Only report genuine causal links, not mere correlations or \
+topical similarity. If no candidate is caused by the source, return an empty list.
+
+IMPORTANT: Write descriptions in the same language as the input claims."""
+
+BFS_EXPANSION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "caused_claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target_index": {
+                        "type": "integer",
+                        "description": "Index of the caused claim in the candidate list.",
+                    },
+                    "mechanism": {
+                        "type": "string",
+                        "description": "Specific causal mechanism.",
+                    },
+                    "strength": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Causal strength 0.0-1.0.",
+                    },
+                    "causal_type": {
+                        "type": "string",
+                        "enum": ["direct", "indirect", "probabilistic", "enabling", "inhibiting", "triggering"],
+                    },
+                    "time_delay": {
+                        "type": "string",
+                        "description": "Estimated time between cause and effect.",
+                    },
+                },
+                "required": ["target_index", "mechanism", "strength", "causal_type", "time_delay"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["caused_claims"],
+    "additionalProperties": False,
+}
+
+# --- Pairwise prompts (legacy, used as fallback for incremental inference) ---
 
 CAUSAL_INFERENCE_SYSTEM = """\
 You are an expert in causal reasoning, epistemology, and systems thinking. Your task \

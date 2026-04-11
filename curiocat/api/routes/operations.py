@@ -64,10 +64,13 @@ def _build_ops(session: AsyncSession):
     llm = get_llm_client()
     embedder = EmbeddingService()
 
-    search_client = None
+    # Default to DuckDuckGo (free); use Brave if API key is configured
     if settings.brave_search_api_key:
         from curiocat.evidence.web_search import BraveSearchClient
         search_client = BraveSearchClient(settings.brave_search_api_key)
+    else:
+        from curiocat.evidence.web_search import DuckDuckGoSearchClient
+        search_client = DuckDuckGoSearchClient()
 
     return GraphOperations(session, llm, embedder, search_client)
 
@@ -121,6 +124,7 @@ def _edge_to_response(edge) -> EdgeResponse:
         temporal_window=getattr(edge, "temporal_window", None),
         decay_type=getattr(edge, "decay_type", "none"),
         bias_warnings=getattr(edge, "bias_warnings", None) or [],
+        is_feedback=getattr(edge, "is_feedback", False),
         evidences=evidences,
     )
 

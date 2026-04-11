@@ -26,6 +26,7 @@ from curiocat.pipeline.claim_extractor import ClaimExtractor
 from curiocat.pipeline.dag_builder import DAGBuilder
 from curiocat.pipeline.discovery import DiscoveryEngine
 from curiocat.pipeline.evidence_grounder import EvidenceGrounder
+from curiocat.pipeline.statistical_validator import StatisticalValidator
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +38,11 @@ STAGE_CLAIM_EXTRACTION = "claim_extraction"
 STAGE_CAUSAL_INFERENCE = "causal_inference"
 STAGE_BIAS_AUDIT = "bias_audit"
 STAGE_EVIDENCE_GROUNDING = "evidence_grounding"
+STAGE_STATISTICAL_VALIDATION = "statistical_validation"
 STAGE_DISCOVERY = "discovery"
 STAGE_DAG_CONSTRUCTION = "dag_construction"
 STAGE_BELIEF_PROPAGATION = "belief_propagation"
+STAGE_GRAPH_UPDATED = "graph_updated"
 
 # Event callback type alias
 EventCallback = Callable[["PipelineEvent"], Coroutine[Any, Any, None]] | None
@@ -95,6 +98,7 @@ class CausalPipeline:
         llm_client: LLMClient,
         embedding_service: EmbeddingService,
         search_client: BraveSearchClient | None = None,
+        metric_data: dict | None = None,
     ) -> None:
         self.session = session
         self.claim_extractor = ClaimExtractor(llm_client, embedding_service)
@@ -107,6 +111,111 @@ class CausalPipeline:
         )
         self.discovery_engine = DiscoveryEngine(llm_client, embedding_service, search_client)
         self.dag_builder = DAGBuilder()
+        self.statistical_validator = StatisticalValidator(metric_data)
+
+    # Ordered pipeline stages for checkpoint comparison
+    _STAGE_ORDER = [
+        STAGE_CLAIM_EXTRACTION,
+        STAGE_CAUSAL_INFERENCE,
+        STAGE_BIAS_AUDIT,
+        STAGE_EVIDENCE_GROUNDING,
+        STAGE_STATISTICAL_VALIDATION,
+        STAGE_DISCOVERY,
+        STAGE_DAG_CONSTRUCTION,
+        STAGE_BELIEF_PROPAGATION,
+    ]
+
+    def _stage_completed(self, stage: str, checkpoint: str | None) -> bool:
+        """Check if a stage was already completed in a previous run."""
+        if checkpoint is None:
+            return False
+        try:
+            return self._STAGE_ORDER.index(stage) <= self._STAGE_ORDER.index(checkpoint)
+        except ValueError:
+            return False
+
+    async def _save_checkpoint(
+        self, project_id: uuid.UUID, stage: str
+    ) -> None:
+        """Record the last completed stage for resume capability."""
+        try:
+            project = await self.session.get(Project, project_id)
+            if project is not None:
+                project.last_completed_stage = stage
+                await self.session.flush()
+        except Exception as exc:
+            logger.warning("Failed to save checkpoint: %s", exc)
+
+    async def _load_claims_from_db(
+        self, project_id: uuid.UUID
+    ) -> tuple[list[dict[str, Any]], list[uuid.UUID]]:
+        """Load existing claims from DB for pipeline resume."""
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(Claim)
+            .where(Claim.project_id == project_id)
+            .order_by(Claim.order_index)
+        )
+        db_claims = result.scalars().all()
+
+        claims: list[dict[str, Any]] = []
+        claim_db_ids: list[uuid.UUID] = []
+        for c in db_claims:
+            claims.append({
+                "text": c.text,
+                "type": c.claim_type,
+                "confidence": c.confidence,
+                "embedding": list(c.embedding) if c.embedding is not None else None,
+                "order_index": c.order_index,
+                "source_sentence": c.source_sentence or "",
+                "layer": c.layer,
+            })
+            claim_db_ids.append(c.id)
+
+        return claims, claim_db_ids
+
+    async def _load_edges_from_db(
+        self, project_id: uuid.UUID, claim_db_ids: list[uuid.UUID],
+    ) -> tuple[list[dict[str, Any]], list[uuid.UUID]]:
+        """Load existing edges from DB for pipeline resume."""
+        from sqlalchemy import select
+
+        result = await self.session.execute(
+            select(CausalEdge)
+            .where(CausalEdge.project_id == project_id)
+        )
+        db_edges = result.scalars().all()
+
+        # Build claim UUID → index mapping
+        id_to_idx = {cid: idx for idx, cid in enumerate(claim_db_ids)}
+
+        edges: list[dict[str, Any]] = []
+        edge_db_ids: list[uuid.UUID] = []
+        for e in db_edges:
+            src_idx = id_to_idx.get(e.source_claim_id)
+            tgt_idx = id_to_idx.get(e.target_claim_id)
+            if src_idx is None or tgt_idx is None:
+                continue
+            edges.append({
+                "source_idx": src_idx,
+                "target_idx": tgt_idx,
+                "mechanism": e.mechanism,
+                "strength": e.strength,
+                "time_delay": e.time_delay,
+                "conditions": e.conditions or [],
+                "reversible": e.reversible,
+                "direction": "source_to_target",
+                "causal_type": e.causal_type,
+                "condition_type": e.condition_type,
+                "temporal_window": e.temporal_window,
+                "decay_type": e.decay_type,
+                "evidence_score": e.evidence_score,
+                "bias_warnings": e.bias_warnings,
+            })
+            edge_db_ids.append(e.id)
+
+        return edges, edge_db_ids
 
     async def run(
         self,
@@ -117,16 +226,9 @@ class CausalPipeline:
     ) -> dict[str, Any]:
         """Run the full pipeline with multi-layer discovery.
 
-        Layer 0 (Seed): Extract claims from user text, infer causal links,
-        audit for biases, and ground with evidence.
-
-        Layers 1..N (Discovery): Extract new claims from evidence snippets,
-        run incremental causal inference on new claims, audit and ground.
-        Stops when no new claims are discovered, diminishing returns
-        (<2 new claims AND <1 new edge), or layer budget exhausted.
-
-        Final: Build DAG, propagate beliefs, compute critical path and
-        sensitivity analysis.
+        Supports **checkpoint resume**: if the pipeline previously failed,
+        it loads existing claims/edges from the database and skips
+        already-completed stages.
 
         Args:
             project_id: The UUID of the project to associate results with.
@@ -142,101 +244,172 @@ class CausalPipeline:
         """
         project_uuid = uuid.UUID(project_id) if isinstance(project_id, str) else project_id
 
+        # Check for existing checkpoint
+        project = await self.session.get(Project, project_uuid)
+        checkpoint = project.last_completed_stage if project else None
+        resuming = checkpoint is not None
+
+        if resuming:
+            logger.info(
+                "Resuming pipeline for project %s from checkpoint: %s",
+                project_id, checkpoint,
+            )
+
         try:
             # ==================================================================
             # Layer 0: Seed
             # ==================================================================
 
             # Stage 1: Claim Extraction
-            await self._emit(
-                PipelineEvent(STAGE_CLAIM_EXTRACTION, "started", progress=0.0, layer=0),
-                event_callback,
-            )
+            if self._stage_completed(STAGE_CLAIM_EXTRACTION, checkpoint):
+                # Resume: load existing claims from DB
+                logger.info("Skipping claim extraction (checkpoint)")
+                claims, claim_db_ids = await self._load_claims_from_db(project_uuid)
+                has_temporal = project.has_temporal if project else True
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_CLAIM_EXTRACTION, "completed",
+                        data={"count": len(claims), "resumed": True},
+                        progress=0.10, layer=0,
+                    ),
+                    event_callback,
+                )
+            else:
+                # Fresh run: extract claims
+                await self._emit(
+                    PipelineEvent(STAGE_CLAIM_EXTRACTION, "started", progress=0.0, layer=0),
+                    event_callback,
+                )
 
-            claims, has_temporal = await self.claim_extractor.extract(text)
+                # Phase A: LLM extraction — fast, no embedding yet
+                claims, has_temporal = await self.claim_extractor.extract(text)
 
-            # Persist temporal relevance flag on the project
-            project = await self.session.get(Project, project_uuid)
-            if project is not None:
-                project.has_temporal = has_temporal
-                await self.session.flush()
+                if project is not None:
+                    project.has_temporal = has_temporal
+                    await self.session.flush()
 
-            # Tag seed claims as layer 0
-            for c in claims:
-                c["layer"] = 0
+                for c in claims:
+                    c["layer"] = 0
 
-            await self._emit(
-                PipelineEvent(
-                    STAGE_CLAIM_EXTRACTION, "completed",
-                    data={
-                        "count": len(claims),
-                        "claims": _lightweight_claims(claims),
-                    },
-                    progress=0.10, layer=0,
-                ),
-                event_callback,
-            )
+                if not claims:
+                    raise PipelineError("No claims were extracted from the input text")
 
-            if not claims:
-                raise PipelineError("No claims were extracted from the input text")
+                # Save claims to DB immediately (without embeddings)
+                claim_db_ids = await self._save_claims(project_uuid, claims)
+                await self.session.commit()
+                logger.info("Claims saved (no embeddings yet): %d", len(claims))
+                await self._emit_graph_updated(event_callback, "claims_extracted")
 
-            # Persist claims immediately after extraction
-            claim_db_ids = await self._save_claims(project_uuid, claims)
-            await self.session.commit()
-            logger.info("Claims committed: %d", len(claims))
+                # Phase B: Embed + deduplicate
+                claims = await self.claim_extractor.embed_claims(claims)
+                await self._update_claim_embeddings(project_uuid, claims, claim_db_ids)
+                await self.session.commit()
+                logger.info("Claims embedded and deduplicated: %d", len(claims))
+
+                claim_db_ids = [
+                    claim_db_ids[c["order_index"]] for c in claims
+                ]
+
+                await self._save_checkpoint(project_uuid, STAGE_CLAIM_EXTRACTION)
+                await self.session.commit()
+
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_CLAIM_EXTRACTION, "completed",
+                        data={"count": len(claims), "claims": _lightweight_claims(claims)},
+                        progress=0.10, layer=0,
+                    ),
+                    event_callback,
+                )
+                await self._emit_graph_updated(event_callback, "claims_embedded")
 
             # Stage 2: Causal Inference
-            await self._emit(
-                PipelineEvent(STAGE_CAUSAL_INFERENCE, "started", progress=0.10, layer=0),
-                event_callback,
-            )
+            if self._stage_completed(STAGE_CAUSAL_INFERENCE, checkpoint):
+                logger.info("Skipping causal inference (checkpoint)")
+                edges, edge_db_ids = await self._load_edges_from_db(project_uuid, claim_db_ids)
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_CAUSAL_INFERENCE, "completed",
+                        data={"count": len(edges), "resumed": True},
+                        progress=0.20, layer=0,
+                    ),
+                    event_callback,
+                )
+            else:
+                await self._emit(
+                    PipelineEvent(STAGE_CAUSAL_INFERENCE, "started", progress=0.10, layer=0),
+                    event_callback,
+                )
 
-            edges = await self.causal_inferrer.infer(claims)
+                edges = await self.causal_inferrer.infer(claims)
 
-            await self._emit(
-                PipelineEvent(
-                    STAGE_CAUSAL_INFERENCE, "completed",
-                    data={
-                        "count": len(edges),
-                        "edges": _lightweight_edges(claims, edges),
-                    },
-                    progress=0.20, layer=0,
-                ),
-                event_callback,
-            )
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_CAUSAL_INFERENCE, "completed",
+                        data={
+                            "count": len(edges),
+                            "edges": _lightweight_edges(claims, edges),
+                        },
+                        progress=0.20, layer=0,
+                    ),
+                    event_callback,
+                )
 
-            # Persist edges immediately after inference
-            edge_db_ids = await self._save_edges(project_uuid, edges, claim_db_ids)
-            await self.session.commit()
-            logger.info("Edges committed: %d", len(edges))
+                edge_db_ids = await self._save_edges(project_uuid, edges, claim_db_ids)
+                await self._save_checkpoint(project_uuid, STAGE_CAUSAL_INFERENCE)
+                await self.session.commit()
+                logger.info("Edges committed: %d", len(edges))
+                await self._emit_graph_updated(event_callback, "edges_inferred")
 
             # Stage 2.5: Bias Audit
-            await self._emit(
-                PipelineEvent(STAGE_BIAS_AUDIT, "started", progress=0.20, layer=0),
-                event_callback,
-            )
+            if self._stage_completed(STAGE_BIAS_AUDIT, checkpoint):
+                logger.info("Skipping bias audit (checkpoint)")
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_BIAS_AUDIT, "completed",
+                        data={"edges_audited": len(edges), "resumed": True},
+                        progress=0.30, layer=0,
+                    ),
+                    event_callback,
+                )
+            else:
+                await self._emit(
+                    PipelineEvent(STAGE_BIAS_AUDIT, "started", progress=0.20, layer=0),
+                    event_callback,
+                )
 
-            edges = await self.bias_auditor.audit(claims, edges)
+                edges = await self.bias_auditor.audit(claims, edges)
 
-            await self._emit(
-                PipelineEvent(
-                    STAGE_BIAS_AUDIT, "completed",
-                    data={
-                        "edges_audited": len(edges),
-                        "edges": _lightweight_edges(claims, edges),
-                    },
-                    progress=0.30, layer=0,
-                ),
-                event_callback,
-            )
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_BIAS_AUDIT, "completed",
+                        data={
+                            "edges_audited": len(edges),
+                            "edges": _lightweight_edges(claims, edges),
+                        },
+                        progress=0.30, layer=0,
+                    ),
+                    event_callback,
+                )
 
-            # Update edges in DB with bias audit results
-            await self._update_edges(edge_db_ids, edges)
-            await self.session.commit()
-            logger.info("Bias audit committed for %d edges", len(edges))
+                await self._update_edges(edge_db_ids, edges)
+                await self._save_checkpoint(project_uuid, STAGE_BIAS_AUDIT)
+                await self.session.commit()
+                logger.info("Bias audit committed for %d edges", len(edges))
+                await self._emit_graph_updated(event_callback, "bias_audited")
 
             # Stage 3: Evidence Grounding
-            if self.evidence_grounder and edges:
+            if self._stage_completed(STAGE_EVIDENCE_GROUNDING, checkpoint):
+                logger.info("Skipping evidence grounding (checkpoint)")
+                await self._emit(
+                    PipelineEvent(
+                        STAGE_EVIDENCE_GROUNDING, "completed",
+                        data={"resumed": True},
+                        progress=0.40, layer=0,
+                    ),
+                    event_callback,
+                )
+            elif self.evidence_grounder and edges:
                 await self._emit(
                     PipelineEvent(STAGE_EVIDENCE_GROUNDING, "started", progress=0.30, layer=0),
                     event_callback,
@@ -275,8 +448,10 @@ class CausalPipeline:
                 # Update edges with evidence scores and save evidence records
                 await self._update_edges(edge_db_ids, edges)
                 await self._save_evidences(edges, edge_db_ids)
+                await self._save_checkpoint(project_uuid, STAGE_EVIDENCE_GROUNDING)
                 await self.session.commit()
                 logger.info("Evidence grounding committed for %d edges", len(edges))
+                await self._emit_graph_updated(event_callback, "evidence_grounded")
             else:
                 logger.info("Skipping evidence grounding (no search client or no edges)")
                 await self._emit(
@@ -289,9 +464,42 @@ class CausalPipeline:
                 )
 
             # ==================================================================
+            # Stage 3.5: Statistical Validation
+            # ==================================================================
+            await self._emit(
+                PipelineEvent(STAGE_STATISTICAL_VALIDATION, "started", progress=0.40),
+                event_callback,
+            )
+
+            edges = self.statistical_validator.validate(claims, edges)
+
+            stat_counts = {"confirmed": 0, "unsupported": 0, "contradicted": 0, "not_tested": 0}
+            for e in edges:
+                sv = e.get("statistical_validation", "not_tested")
+                stat_counts[sv] = stat_counts.get(sv, 0) + 1
+
+            await self._emit(
+                PipelineEvent(
+                    STAGE_STATISTICAL_VALIDATION, "completed",
+                    data=stat_counts,
+                    progress=0.42,
+                ),
+                event_callback,
+            )
+
+            # Update edges in DB with statistical validation results
+            await self._update_edges(edge_db_ids, edges)
+            await self.session.commit()
+            logger.info(
+                "Statistical validation committed: %d confirmed, %d unsupported, %d contradicted",
+                stat_counts["confirmed"], stat_counts["unsupported"], stat_counts["contradicted"],
+            )
+            await self._emit_graph_updated(event_callback, "statistical_validated")
+
+            # ==================================================================
             # Layers 1..N: Discovery
             # ==================================================================
-            # Discovery layers share progress range 0.40 -> 0.70
+            # Discovery layers share progress range 0.42 -> 0.70
             discovery_progress_range = 0.30  # 0.40 to 0.70
             progress_per_layer = discovery_progress_range / max_layers if max_layers > 0 else 0
 
@@ -364,6 +572,7 @@ class CausalPipeline:
                 new_claim_db_ids = await self._save_claims(project_uuid, new_claims)
                 claim_db_ids.extend(new_claim_db_ids)
                 await self.session.commit()
+                await self._emit_graph_updated(event_callback, f"discovery_L{layer}_claims")
 
                 # Incremental causal inference
                 await self._emit(
@@ -375,6 +584,17 @@ class CausalPipeline:
                 )
 
                 new_edges = await self.causal_inferrer.infer_incremental(claims, new_indices)
+
+                # Enforce global edge budget: total edges ≤ claims × 2
+                max_total_edges = max(10, len(claims) * 2)
+                edge_room = max(0, max_total_edges - len(edges))
+                if len(new_edges) > edge_room:
+                    new_edges.sort(key=lambda e: e.get("strength", 0), reverse=True)
+                    new_edges = new_edges[:edge_room]
+                    logger.info(
+                        "Discovery L%d: pruned incremental edges to %d (budget: %d total)",
+                        layer, edge_room, max_total_edges,
+                    )
 
                 await self._emit(
                     PipelineEvent(
@@ -394,6 +614,7 @@ class CausalPipeline:
                 )
                 edge_db_ids.extend(new_edge_db_ids)
                 await self.session.commit()
+                await self._emit_graph_updated(event_callback, f"discovery_L{layer}_edges")
 
                 # Bias audit on new edges
                 if new_edges:
@@ -422,6 +643,7 @@ class CausalPipeline:
                     # Update edges in DB with bias results
                     await self._update_edges(new_edge_db_ids, new_edges)
                     await self.session.commit()
+                    await self._emit_graph_updated(event_callback, f"discovery_L{layer}_bias")
 
                 # Evidence grounding on new edges
                 if self.evidence_grounder and new_edges:
@@ -471,6 +693,7 @@ class CausalPipeline:
                     await self._update_edges(new_edge_db_ids, new_edges)
                     await self._save_evidences(new_edges, new_edge_db_ids)
                     await self.session.commit()
+                    await self._emit_graph_updated(event_callback, f"discovery_L{layer}_evidence")
 
                 edges.extend(new_edges)
                 logger.info(
@@ -493,13 +716,15 @@ class CausalPipeline:
                 event_callback,
             )
 
-            graph, logic_gate_map = self.dag_builder.build(claims, edges)
+            graph, logic_gate_map, feedback_edges = self.dag_builder.build(claims, edges)
 
             await self._update_claim_logic_gates(
                 claim_db_ids, claims, logic_gate_map
             )
+            await self._mark_feedback_edges(claim_db_ids, feedback_edges)
             await self.session.commit()
             logger.info("DAG construction committed: logic gates updated")
+            await self._emit_graph_updated(event_callback, "dag_constructed")
 
             await self._emit(
                 PipelineEvent(
@@ -574,6 +799,24 @@ class CausalPipeline:
         if callback is not None:
             await callback(event)
 
+    async def _emit_graph_updated(
+        self,
+        callback: EventCallback,
+        reason: str,
+    ) -> None:
+        """Emit a graph_updated event after data has been committed to DB.
+
+        The frontend listens for this to re-fetch the graph, providing
+        real-time incremental updates as claims and edges are discovered.
+        """
+        await self._emit(
+            PipelineEvent(
+                STAGE_GRAPH_UPDATED, "completed",
+                data={"reason": reason},
+            ),
+            callback,
+        )
+
     async def _save_claims(
         self,
         project_id: uuid.UUID,
@@ -608,6 +851,40 @@ class CausalPipeline:
         await self.session.flush()
         logger.info("Saved %d claims to database", len(claim_ids))
         return claim_ids
+
+    async def _update_claim_embeddings(
+        self,
+        project_id: uuid.UUID,
+        claims: list[dict[str, Any]],
+        all_claim_db_ids: list[uuid.UUID],
+    ) -> None:
+        """Update claim embeddings and delete duplicates after deduplication.
+
+        After embed_claims() runs, some original claims may have been removed
+        as duplicates. This updates embeddings on kept claims and deletes
+        the duplicates from the DB.
+        """
+        kept_indices = {c["order_index"] for c in claims}
+
+        for claim_data in claims:
+            idx = claim_data["order_index"]
+            claim_id = all_claim_db_ids[idx]
+            db_claim = await self.session.get(Claim, claim_id)
+            if db_claim is not None and "embedding" in claim_data:
+                db_claim.embedding = claim_data["embedding"]
+
+        # Delete duplicate claims from DB
+        for idx, claim_id in enumerate(all_claim_db_ids):
+            if idx not in kept_indices:
+                db_claim = await self.session.get(Claim, claim_id)
+                if db_claim is not None:
+                    await self.session.delete(db_claim)
+
+        await self.session.flush()
+        logger.info(
+            "Updated embeddings for %d claims, removed %d duplicates",
+            len(claims), len(all_claim_db_ids) - len(claims),
+        )
 
     async def _save_edges(
         self,
@@ -675,6 +952,13 @@ class CausalPipeline:
             )
             if "bias_warnings" in edge_data:
                 db_edge.bias_warnings = edge_data["bias_warnings"]
+            if "statistical_validation" in edge_data:
+                db_edge.statistical_validation = edge_data["statistical_validation"]
+            if "stat_p_value" in edge_data:
+                db_edge.stat_p_value = edge_data.get("stat_p_value")
+                db_edge.stat_f_statistic = edge_data.get("stat_f_statistic")
+                db_edge.stat_effect_size = edge_data.get("stat_effect_size")
+                db_edge.stat_lag = edge_data.get("stat_lag")
         await self.session.flush()
 
     async def _save_evidences(
@@ -738,6 +1022,44 @@ class CausalPipeline:
         if updated > 0:
             await self.session.flush()
         logger.info("Updated logic gates for %d claims", updated)
+
+    async def _mark_feedback_edges(
+        self,
+        claim_ids: list[uuid.UUID],
+        feedback_edges: list[tuple[str, str]],
+    ) -> None:
+        """Mark edges removed during cycle-breaking as feedback edges in DB.
+
+        Args:
+            claim_ids: List of claim UUIDs (indexed by claim order).
+            feedback_edges: List of (source_node_id, target_node_id) tuples
+                where node IDs are string indices into the claims list.
+        """
+        if not feedback_edges:
+            return
+
+        from sqlalchemy import select, and_
+
+        marked = 0
+        for source_idx_str, target_idx_str in feedback_edges:
+            source_uuid = claim_ids[int(source_idx_str)]
+            target_uuid = claim_ids[int(target_idx_str)]
+            result = await self.session.execute(
+                select(CausalEdge).where(
+                    and_(
+                        CausalEdge.source_claim_id == source_uuid,
+                        CausalEdge.target_claim_id == target_uuid,
+                    )
+                )
+            )
+            db_edge = result.scalars().first()
+            if db_edge is not None:
+                db_edge.is_feedback = True
+                marked += 1
+
+        if marked > 0:
+            await self.session.flush()
+        logger.info("Marked %d feedback edges", marked)
 
     async def _update_project_status(
         self,

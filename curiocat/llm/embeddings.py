@@ -18,7 +18,7 @@ from curiocat.exceptions import LLMError
 logger = logging.getLogger(__name__)
 
 # Maximum number of texts per single embedding API call.
-_BATCH_CHUNK_SIZE = 100
+_BATCH_CHUNK_SIZE = 10
 
 
 class EmbeddingService:
@@ -28,10 +28,18 @@ class EmbeddingService:
     provider is used for text generation.
     """
 
-    def __init__(self, api_key: str | None = None) -> None:
-        self._client = openai.AsyncOpenAI(
-            api_key=api_key or settings.openai_api_key,
-        )
+    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+        # Embeddings use their own API key/base URL settings, falling back to
+        # the main OpenAI key but NOT the chat proxy (which often doesn't
+        # support embedding models).
+        kwargs: dict = {
+            "api_key": api_key or settings.embedding_api_key or settings.openai_api_key,
+        }
+        url = base_url or settings.embedding_base_url
+        if url:
+            kwargs["base_url"] = url
+        # Note: intentionally does NOT fall back to settings.openai_base_url
+        self._client = openai.AsyncOpenAI(**kwargs)
         self._model = settings.embedding_model
         self._dimensions = settings.embedding_dimensions
 

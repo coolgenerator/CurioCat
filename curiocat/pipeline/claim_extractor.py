@@ -83,19 +83,16 @@ class ClaimExtractor:
         Pipeline:
         1. Chunk long text into overlapping windows.
         2. For each chunk, call the LLM to extract structured claims.
-        3. Merge results across chunks.
-        4. Deduplicate claims by embedding cosine similarity (>0.95 = duplicate).
-        5. Batch-embed all unique claims.
-        6. Return list of claim dicts with their embeddings attached,
-           plus a boolean indicating temporal relevance.
+        3. Merge results across chunks and assign order indices.
+        4. Return claims WITHOUT embeddings (for fast initial display).
+
+        Embeddings are added later via ``embed_claims()``.
 
         Args:
             text: The input text to decompose into claims.
 
         Returns:
-            A tuple of (claims, has_temporal_relevance) where claims is a list
-            of dicts and has_temporal_relevance indicates whether the content
-            describes events with meaningful temporal relationships.
+            A tuple of (claims, has_temporal_relevance).
 
         Raises:
             PipelineError: If claim extraction fails.
@@ -106,9 +103,8 @@ class ClaimExtractor:
         chunks = _chunk_text(text)
         logger.info("Extracting claims from %d chunk(s)", len(chunks))
 
-        # Stage 1: Extract claims from each chunk
         all_raw_claims: list[dict[str, Any]] = []
-        has_temporal = True  # default to true for backwards compatibility
+        has_temporal = True
         for i, chunk in enumerate(chunks):
             logger.debug("Processing chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
             try:
@@ -121,7 +117,14 @@ class ClaimExtractor:
                     schema=CLAIM_EXTRACTION_SCHEMA,
                 )
                 claims = result.get("claims", [])
-                # Use temporal relevance from the first chunk (which sees the opening context)
+                # Use logprob-based confidence if available (more calibrated
+                # than LLM self-reported confidence scores)
+                logprob_conf = result.get("_logprob_confidence")
+                if logprob_conf is not None:
+                    for c in claims:
+                        # Blend: 70% logprob + 30% LLM self-report
+                        llm_conf = c.get("confidence", 0.5)
+                        c["confidence"] = round(0.7 * logprob_conf + 0.3 * llm_conf, 3)
                 if i == 0:
                     has_temporal = result.get("has_temporal_relevance", True)
                 logger.debug("Extracted %d claims from chunk %d", len(claims), i + 1)
@@ -135,17 +138,45 @@ class ClaimExtractor:
             logger.warning("No claims extracted from any chunk")
             return [], has_temporal
 
-        # Stage 2: Embed all claim texts for deduplication
-        claim_texts = [c["text"] for c in all_raw_claims]
+        # Assign order indices (no embedding yet — that's done separately)
+        for order, claim in enumerate(all_raw_claims):
+            claim["order_index"] = order
+            claim["source_sentence"] = claim.get("source_sentence", "")
+
+        logger.info("Extracted %d raw claims", len(all_raw_claims))
+        return all_raw_claims, has_temporal
+
+    async def embed_claims(
+        self, claims: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Embed claims and deduplicate by cosine similarity.
+
+        This is separated from ``extract()`` so that claims can be saved
+        to the database and shown to the user immediately, before the
+        (slower) embedding step runs.
+
+        Args:
+            claims: List of claim dicts from ``extract()``.
+
+        Returns:
+            Deduplicated claims with "embedding" keys attached.
+
+        Raises:
+            PipelineError: If embedding fails.
+        """
+        if not claims:
+            return claims
+
+        claim_texts = [c["text"] for c in claims]
         try:
             embeddings = await self._embedder.embed_batch(claim_texts)
         except Exception as exc:
             raise PipelineError(f"Failed to embed claims: {exc}") from exc
 
-        # Stage 3: Deduplicate by cosine similarity
+        # Deduplicate by cosine similarity
         embedding_matrix = np.array(embeddings)
         unique_indices: list[int] = []
-        for idx in range(len(all_raw_claims)):
+        for idx in range(len(claims)):
             is_duplicate = False
             for kept_idx in unique_indices:
                 sim = _cosine_similarity(
@@ -153,29 +184,20 @@ class ClaimExtractor:
                 )
                 if sim > _DEDUP_SIMILARITY_THRESHOLD:
                     is_duplicate = True
-                    logger.debug(
-                        "Claim %d is a duplicate of claim %d (similarity=%.3f)",
-                        idx,
-                        kept_idx,
-                        sim,
-                    )
                     break
             if not is_duplicate:
                 unique_indices.append(idx)
 
         logger.info(
             "Deduplicated %d raw claims to %d unique claims",
-            len(all_raw_claims),
-            len(unique_indices),
+            len(claims), len(unique_indices),
         )
 
-        # Stage 4: Build final output with embeddings
         result_claims: list[dict[str, Any]] = []
         for order, idx in enumerate(unique_indices):
-            claim = all_raw_claims[idx]
+            claim = claims[idx]
             claim["embedding"] = embeddings[idx]
             claim["order_index"] = order
-            claim["source_sentence"] = claim.get("source_sentence", "")
             result_claims.append(claim)
 
-        return result_claims, has_temporal
+        return result_claims
