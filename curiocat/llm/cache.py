@@ -236,6 +236,11 @@ class CachedLLMClient(LLMClient):
         """Pass through to inner client (not cached)."""
         return await self._inner.complete(system, user, **kwargs)
 
+    async def stream_complete(self, system: str, user: str, **kwargs: Any):
+        """Pass through streaming to inner client (not cached)."""
+        async for chunk in self._inner.stream_complete(system, user, **kwargs):
+            yield chunk
+
     async def complete_json(
         self, system: str, user: str, schema: dict, **kwargs: Any
     ) -> dict:

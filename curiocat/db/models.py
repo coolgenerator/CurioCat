@@ -249,6 +249,21 @@ class EventTimeline(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AdvisorMessage(Base):
+    """Persisted advisor conversation messages."""
+
+    __tablename__ = "advisor_message"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE")
+    )
+    role: Mapped[str] = mapped_column(String(20))  # "user" or "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class MetricSeries(Base):
     """Time-series metric data from CSV/Excel/screenshot uploads."""
 

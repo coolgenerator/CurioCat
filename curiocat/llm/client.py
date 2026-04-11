@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 class LLMClient(ABC):
     """Abstract base class for LLM interactions."""
 
+    async def stream_complete(
+        self, system: str, user: str, **kwargs: Any
+    ):
+        """Stream a text completion token by token.
+
+        Default implementation falls back to non-streaming complete().
+        Subclasses can override for true streaming.
+
+        Yields:
+            str: Individual text chunks as they arrive.
+        """
+        result = await self.complete(system, user, **kwargs)
+        yield result
+
     @abstractmethod
     async def complete(self, system: str, user: str, **kwargs: Any) -> str:
         """Generate a text completion given system and user prompts.
@@ -69,6 +83,26 @@ class OpenAIClient(LLMClient):
             kwargs["base_url"] = url
         self._client = openai.AsyncOpenAI(**kwargs)
         self._model = model or settings.llm_model
+
+    async def stream_complete(self, system: str, user: str, **kwargs: Any):
+        """Stream completion tokens from OpenAI API."""
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=kwargs.get("temperature", 0.3),
+                max_tokens=kwargs.get("max_tokens", 4096),
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+                if delta:
+                    yield delta
+        except openai.APIError as exc:
+            raise LLMError(f"OpenAI streaming error: {exc}") from exc
 
     @retry(
         retry=retry_if_exception_type(

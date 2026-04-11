@@ -421,38 +421,14 @@ async def advise(
     session: AsyncSession = Depends(get_session),
 ) -> AdviseResult:
     """Generate a strategic advisory report based on the causal graph and user context."""
-    from curiocat.graph.critical_path import find_critical_path
-    from curiocat.graph.sensitivity import analyze_sensitivity
     from curiocat.llm.client import get_llm_client
     from curiocat.llm.prompts.strategic_advisor import (
         STRATEGIC_ADVISOR_SCHEMA,
         STRATEGIC_ADVISOR_SYSTEM,
     )
 
-    _project, claims, edges = await _load_project_graph(project_id, session)
-    if not claims:
-        raise HTTPException(status_code=404, detail="No graph data")
+    user_msg = await _build_advise_prompt(project_id, req, session)
 
-    # Build and analyze graph
-    graph = _build_nx_graph(claims, edges)
-    propagate_beliefs(graph)
-    sensitivity = analyze_sensitivity(graph)
-    critical_path = find_critical_path(graph)
-
-    # Build compressed summary
-    summary = _build_graph_summary(graph, critical_path, sensitivity)
-
-    # Compose user message
-    perspective_str = ""
-    if req.perspective_tags:
-        perspective_str = f"\nPerspective/role: {', '.join(req.perspective_tags)}"
-
-    user_msg = (
-        f"## User Business Context\n{req.user_context}{perspective_str}\n\n"
-        f"## Causal Graph Summary\n{summary}"
-    )
-
-    # LLM call
     llm = get_llm_client()
     result = await llm.complete_json(
         system=STRATEGIC_ADVISOR_SYSTEM,
@@ -463,3 +439,139 @@ async def advise(
     )
 
     return AdviseResult(**result)
+
+
+@router.post("/graph/{project_id}/advise/stream")
+async def advise_stream(
+    project_id: UUID,
+    req: AdviseRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream a strategic advisory report token by token via SSE.
+
+    Instead of waiting for the full JSON response, streams raw text
+    tokens as they arrive from the LLM. The frontend can display
+    partial results progressively.
+    """
+    import json
+    from sse_starlette.sse import EventSourceResponse
+    from curiocat.llm.client import get_llm_client
+    from curiocat.llm.prompts.strategic_advisor import STRATEGIC_ADVISOR_SYSTEM
+
+    user_msg = await _build_advise_prompt(project_id, req, session)
+
+    # Use plain text streaming (not JSON schema) for real-time output
+    streaming_system = (
+        STRATEGIC_ADVISOR_SYSTEM
+        + "\n\nIMPORTANT: Output your analysis as well-structured markdown. "
+        "Use ## headings for sections: Impact Assessment, Predictions, "
+        "Recommended Actions, Escalation Scenarios, Key Indicators."
+    )
+
+    llm = get_llm_client(enable_cache=False)
+
+    async def _event_generator():
+        try:
+            async for chunk in llm.stream_complete(
+                system=streaming_system,
+                user=user_msg,
+                max_tokens=8192,
+                temperature=0.3,
+            ):
+                yield {
+                    "event": "token",
+                    "data": json.dumps({"text": chunk}),
+                }
+            yield {
+                "event": "complete",
+                "data": json.dumps({"status": "done"}),
+            }
+        except Exception as exc:
+            yield {
+                "event": "error",
+                "data": json.dumps({"message": str(exc)}),
+            }
+
+    return EventSourceResponse(_event_generator())
+
+
+async def _build_advise_prompt(
+    project_id: UUID,
+    req: AdviseRequest,
+    session: AsyncSession,
+) -> str:
+    """Build the advisor prompt from graph data and user context."""
+    from curiocat.graph.critical_path import find_critical_path
+    from curiocat.graph.sensitivity import analyze_sensitivity
+
+    _project, claims, edges = await _load_project_graph(project_id, session)
+    if not claims:
+        raise HTTPException(status_code=404, detail="No graph data")
+
+    graph = _build_nx_graph(claims, edges)
+    propagate_beliefs(graph)
+    sensitivity = analyze_sensitivity(graph)
+    critical_path = find_critical_path(graph)
+
+    summary = _build_graph_summary(graph, critical_path, sensitivity)
+
+    perspective_str = ""
+    if req.perspective_tags:
+        perspective_str = f"\nPerspective/role: {', '.join(req.perspective_tags)}"
+
+    return (
+        f"## User Business Context\n{req.user_context}{perspective_str}\n\n"
+        f"## Causal Graph Summary\n{summary}"
+    )
+
+
+# --- Advisor conversation history ---
+
+@router.get("/graph/{project_id}/advisor-messages")
+async def get_advisor_messages(
+    project_id: UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Load persisted advisor conversation for a project."""
+    from sqlalchemy import select
+    from curiocat.db.models import AdvisorMessage
+
+    result = await session.execute(
+        select(AdvisorMessage)
+        .where(AdvisorMessage.project_id == project_id)
+        .order_by(AdvisorMessage.created_at)
+    )
+    messages = result.scalars().all()
+
+    return [
+        {
+            "id": str(m.id),
+            "role": m.role,
+            "content": m.content,
+            "tags": m.tags,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in messages
+    ]
+
+
+@router.post("/graph/{project_id}/advisor-messages")
+async def save_advisor_message(
+    project_id: UUID,
+    body: dict,
+    session: AsyncSession = Depends(get_session),
+):
+    """Save a single advisor message (user or assistant)."""
+    from curiocat.db.models import AdvisorMessage
+
+    msg = AdvisorMessage(
+        project_id=project_id,
+        role=body["role"],
+        content=body["content"],
+        tags=body.get("tags"),
+    )
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+
+    return {"id": str(msg.id), "status": "saved"}

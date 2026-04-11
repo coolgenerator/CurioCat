@@ -740,8 +740,10 @@ export default function GraphScreen() {
             )}
             {sidePanel === 'advisor' && (
               <StrategicAdvisorPanel
+                projectId={projectId!}
                 onClose={handleClosePanel}
                 onAdvise={ops.advise}
+                onAdviseStream={ops.adviseStream}
                 onSuggestPerspectives={ops.suggestPerspectives}
                 operationLoading={operationLoading}
               />

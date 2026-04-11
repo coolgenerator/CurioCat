@@ -236,6 +236,74 @@ export function useGraphOperations(projectId: string | null) {
     }
   }, [projectId, dispatch])
 
+  const adviseStream = useCallback((
+    userContext: string,
+    perspectiveTags: string[],
+    onToken: (text: string) => void,
+    onComplete: () => void,
+    onError: (msg: string) => void,
+  ): (() => void) => {
+    if (!projectId) return () => {}
+    dispatch({ type: 'SET_OPERATION_LOADING', operation: 'advise' })
+
+    // POST the request body, then read the SSE stream from the response
+    const abortController = new AbortController()
+
+    fetch(`/api/v1/graph/${projectId}/advise/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_context: userContext, perspective_tags: perspectiveTags }),
+      signal: abortController.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok || !res.body) throw new Error(`API error: ${res.status}`)
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+
+          // Parse SSE events from buffer
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? ''
+
+          for (const line of lines) {
+            if (line.startsWith('data:')) {
+              const data = line.slice(5).trim()
+              if (!data) continue
+              try {
+                const parsed = JSON.parse(data)
+                if (parsed.text) onToken(parsed.text)
+                if (parsed.status === 'done') {
+                  dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+                  onComplete()
+                  return
+                }
+                if (parsed.message) {
+                  dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+                  onError(parsed.message)
+                  return
+                }
+              } catch { /* skip malformed JSON */ }
+            }
+          }
+        }
+        dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+        onComplete()
+      })
+      .catch((err) => {
+        if (err.name !== 'AbortError') {
+          dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+          onError(err.message)
+        }
+      })
+
+    return () => abortController.abort()
+  }, [projectId, dispatch])
+
   return {
     expand,
     traceBack,
@@ -247,6 +315,7 @@ export function useGraphOperations(projectId: string | null) {
     applyCompare,
     suggestPerspectives,
     advise,
+    adviseStream,
     error,
   }
 }
