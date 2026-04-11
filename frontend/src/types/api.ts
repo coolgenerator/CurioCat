@@ -141,6 +141,35 @@ export interface ApiFocusResult {
   paths: ApiPathInfo[]
 }
 
+// --- Enrich ---
+
+export interface ApiEnrichResult {
+  new_nodes: Record<string, unknown>[]
+  new_edges: Record<string, unknown>[]
+  merged_nodes: Record<string, unknown>[]
+  skipped_duplicates: number
+  graph: Record<string, unknown>
+}
+
+// --- Auto Explore ---
+
+export interface ApiWeaknessReport {
+  node_id: string | null
+  edge_id: string | null
+  weakness_type: string
+  action_taken: string
+  result_summary: string
+}
+
+export interface ApiAutoExploreResult {
+  weaknesses_found: ApiWeaknessReport[]
+  new_nodes: Record<string, unknown>[]
+  new_edges: Record<string, unknown>[]
+  converged_edges: Record<string, unknown>[]
+  convergence_reached: boolean
+  graph: Record<string, unknown>
+}
+
 // --- Strategic Advisor ---
 
 export interface ApiPerspectiveSuggestion {

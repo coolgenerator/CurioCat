@@ -10,13 +10,17 @@ import copy
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curiocat.api.models.graph import (
     AdviseRequest,
     AdviseResult,
+    AutoExploreRequest,
+    AutoExploreResult,
     BeliefChange,
+    EnrichResult,
+    EnrichTextRequest,
     PerspectiveSuggestion,
     SuggestPerspectivesResult,
     ChallengeRequest,
@@ -29,6 +33,7 @@ from curiocat.api.models.graph import (
     GraphOperationResult,
     PathInfo,
     TraceBackRequest,
+    WeaknessReport,
     WhatIfModification,
     WhatIfRequest,
     WhatIfResult,
@@ -360,6 +365,414 @@ async def focus_node(
         focus_node_id=node_id,
         visible_node_ids=[UUID(nid) for nid in visible_ids],
         paths=paths,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Enrich
+# ---------------------------------------------------------------------------
+
+
+def _build_merger(session: AsyncSession):
+    """Factory for GraphMerger service."""
+    from curiocat.llm.embeddings import EmbeddingService
+    from curiocat.pipeline.graph_merger import GraphMerger
+
+    return GraphMerger(session, EmbeddingService())
+
+
+@router.post(
+    "/graph/{project_id}/enrich/text",
+    response_model=EnrichResult,
+)
+async def enrich_text(
+    project_id: UUID,
+    req: EnrichTextRequest,
+    session: AsyncSession = Depends(get_session),
+) -> EnrichResult:
+    """Enrich an existing graph with additional text.
+
+    Extracts claims from the text, finds causal links between new and
+    existing claims, then merges everything with deduplication.
+    """
+    from curiocat.llm.client import get_llm_client
+    from curiocat.llm.embeddings import EmbeddingService
+    from curiocat.pipeline.claim_extractor import ClaimExtractor
+    from curiocat.pipeline.causal_inferrer import CausalInferrer
+    from curiocat.pipeline.graph_merger import GraphMerger
+
+    llm = get_llm_client()
+    embedder = EmbeddingService()
+
+    # 1. Extract claims from new text
+    extractor = ClaimExtractor(llm, embedder)
+    input_text = req.text
+    if req.context:
+        input_text = f"{req.context}\n\n{req.text}"
+    raw_claims, _ = await extractor.extract(input_text)
+    if not raw_claims:
+        graph = await _compute_full_graph(project_id, session)
+        return EnrichResult(
+            new_nodes=[], new_edges=[], merged_nodes=[],
+            skipped_duplicates=0, graph=graph,
+        )
+
+    # 2. Embed and dedup new claims among themselves
+    raw_claims = await extractor.embed_claims(raw_claims)
+
+    # 3. Load existing claims for dedup + causal inference context
+    from sqlalchemy import select as sa_select
+    from curiocat.db.models import Claim
+
+    existing_result = await session.execute(
+        sa_select(Claim)
+        .where(Claim.project_id == project_id)
+        .order_by(Claim.order_index)
+    )
+    existing_claims = list(existing_result.scalars().all())
+
+    # 4. Run causal inference: find links between ALL claims (new + existing)
+    existing_claim_dicts = [
+        {
+            "text": c.text,
+            "type": c.claim_type,
+            "confidence": c.confidence,
+            "embedding": c.embedding,
+            "order_index": c.order_index,
+        }
+        for c in existing_claims
+        if c.embedding is not None
+    ]
+    all_claims_for_inference = existing_claim_dicts + raw_claims
+    new_indices = set(range(len(existing_claim_dicts), len(all_claims_for_inference)))
+
+    inferrer = CausalInferrer(llm)
+    new_edges = await inferrer.infer_incremental(all_claims_for_inference, new_indices)
+
+    # 5. Remap edge indices: existing claims keep their DB IDs
+    existing_id_map = {
+        i: existing_claims[i].id
+        for i in range(len(existing_claim_dicts))
+    }
+    # New claims use their position in raw_claims
+    new_offset = len(existing_claim_dicts)
+    remapped_edges = []
+    for edge in new_edges:
+        src_idx = edge["source_idx"]
+        tgt_idx = edge["target_idx"]
+
+        # Convert to raw_claims index space for the merger
+        new_src = src_idx - new_offset if src_idx >= new_offset else None
+        new_tgt = tgt_idx - new_offset if tgt_idx >= new_offset else None
+
+        if new_src is not None and new_tgt is not None:
+            # Both are new claims — use raw index
+            remapped_edges.append({**edge, "source_idx": new_src, "target_idx": new_tgt})
+        elif new_src is not None:
+            # Source is new, target is existing
+            raw_claims[new_src].setdefault("_merged_to", None)
+            edge_copy = {**edge}
+            edge_copy["_existing_target"] = existing_id_map[tgt_idx]
+            edge_copy["source_idx"] = new_src
+            edge_copy["target_idx"] = None
+            remapped_edges.append(edge_copy)
+        elif new_tgt is not None:
+            edge_copy = {**edge}
+            edge_copy["_existing_source"] = existing_id_map[src_idx]
+            edge_copy["source_idx"] = None
+            edge_copy["target_idx"] = new_tgt
+            remapped_edges.append(edge_copy)
+        # If both are existing, skip (edge already exists or should)
+
+    # 6. Merge claims (dedup against existing)
+    merger = GraphMerger(session, embedder)
+    merge_result = await merger.merge_claims(project_id, raw_claims, existing_claims)
+
+    # 7. Wire edges using merged IDs
+    import uuid as uuid_mod
+    from curiocat.db.models import CausalEdge
+
+    for edge in remapped_edges:
+        src_idx = edge.get("source_idx")
+        tgt_idx = edge.get("target_idx")
+
+        # Resolve source ID
+        if src_idx is not None and src_idx < len(raw_claims):
+            src_id = raw_claims[src_idx].get("_merged_to")
+        elif "_existing_source" in edge:
+            src_id = edge["_existing_source"]
+        else:
+            continue
+
+        # Resolve target ID
+        if tgt_idx is not None and tgt_idx < len(raw_claims):
+            tgt_id = raw_claims[tgt_idx].get("_merged_to")
+        elif "_existing_target" in edge:
+            tgt_id = edge["_existing_target"]
+        else:
+            continue
+
+        if src_id is None or tgt_id is None or src_id == tgt_id:
+            continue
+
+        if await merger._would_create_cycle(project_id, src_id, tgt_id):
+            continue
+
+        new_edge = CausalEdge(
+            project_id=project_id,
+            source_claim_id=src_id,
+            target_claim_id=tgt_id,
+            mechanism=edge.get("mechanism", ""),
+            strength=edge.get("strength", 0.5),
+            time_delay=edge.get("time_delay"),
+            conditions=edge.get("conditions"),
+            reversible=edge.get("reversible", False),
+            evidence_score=0.5,
+            causal_type=edge.get("causal_type", "direct"),
+            condition_type=edge.get("condition_type", "contributing"),
+        )
+        session.add(new_edge)
+        merge_result.new_edges.append(new_edge)
+
+    await session.commit()
+
+    graph = await _compute_full_graph(project_id, session)
+
+    return EnrichResult(
+        new_nodes=[_claim_to_response(c) for c in merge_result.new_claims],
+        new_edges=[_edge_to_response(e) for e in merge_result.new_edges],
+        merged_nodes=[_claim_to_response(c) for c in merge_result.merged_claims],
+        skipped_duplicates=merge_result.skipped_duplicates,
+        graph=graph,
+    )
+
+
+@router.post(
+    "/graph/{project_id}/enrich/csv",
+    response_model=EnrichResult,
+)
+async def enrich_csv(
+    project_id: UUID,
+    file: UploadFile,
+    question: str = "What are the causal relationships between these metrics?",
+    data_type: str = "time_series",
+    max_lag: int = 5,
+    alpha: float = 0.05,
+    session: AsyncSession = Depends(get_session),
+) -> EnrichResult:
+    """Enrich a graph by uploading CSV data for statistical causal analysis.
+
+    Runs ThreeLayerEngine on the CSV data, then converts discovered
+    FusedEdges into graph claims and edges with deduplication.
+    """
+    from curiocat.api.routes.causal_analysis import _parse_csv, _persist_evidence, _persist_metrics
+    from curiocat.llm.client import get_llm_client
+    from curiocat.pipeline.three_layer_engine import ThreeLayerEngine
+
+    if file.filename is None:
+        raise HTTPException(400, "File must have a name")
+
+    content_bytes = await file.read()
+    if len(content_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(400, "File exceeds 20MB limit")
+
+    try:
+        data = _parse_csv(content_bytes)
+    except Exception as exc:
+        raise HTTPException(400, f"Failed to parse CSV: {exc}")
+
+    if len(data) < 2:
+        raise HTTPException(400, "Need at least 2 numeric columns")
+
+    llm = get_llm_client()
+    engine = ThreeLayerEngine(llm)
+
+    kwargs: dict = {
+        "question": question,
+        "context_text": f"Data from file: {file.filename}",
+        "max_lag": max_lag,
+        "alpha": alpha,
+    }
+    if data_type == "time_series":
+        kwargs["time_series"] = data
+    else:
+        kwargs["cross_section"] = data
+
+    result = await engine.analyze(**kwargs)
+
+    # Persist metrics and evidence
+    await _persist_metrics(session, project_id, data, file.filename)
+    await _persist_evidence(session, project_id, result)
+
+    # Load existing claims and merge fused edges into the graph
+    from sqlalchemy import select as sa_select
+    from curiocat.db.models import Claim
+
+    existing_result = await session.execute(
+        sa_select(Claim)
+        .where(Claim.project_id == project_id)
+        .order_by(Claim.order_index)
+    )
+    existing_claims = list(existing_result.scalars().all())
+
+    merger = _build_merger(session)
+    merge_result = await merger.merge_fused_edges(
+        project_id, result.edges, existing_claims
+    )
+
+    await session.commit()
+
+    graph = await _compute_full_graph(project_id, session)
+
+    return EnrichResult(
+        new_nodes=[_claim_to_response(c) for c in merge_result.new_claims],
+        new_edges=[_edge_to_response(e) for e in merge_result.new_edges],
+        merged_nodes=[_claim_to_response(c) for c in merge_result.merged_claims],
+        skipped_duplicates=merge_result.skipped_duplicates,
+        graph=graph,
+    )
+
+
+@router.post(
+    "/graph/{project_id}/enrich/screenshot",
+    response_model=EnrichResult,
+)
+async def enrich_screenshot(
+    project_id: UUID,
+    file: UploadFile,
+    question: str = "What causal relationships can you identify from this data?",
+    session: AsyncSession = Depends(get_session),
+) -> EnrichResult:
+    """Enrich a graph by uploading a screenshot for data extraction + analysis.
+
+    Uses Claude Vision to extract data from the image, runs ThreeLayerEngine,
+    then merges discovered relationships into the graph.
+    """
+    from curiocat.api.routes.causal_analysis import (
+        _extract_data_from_image,
+        _parse_extracted_data,
+        _persist_evidence,
+    )
+    from curiocat.llm.client import get_llm_client
+    from curiocat.pipeline.three_layer_engine import ThreeLayerEngine
+
+    if file.filename is None:
+        raise HTTPException(400, "File must have a name")
+
+    content_bytes = await file.read()
+    if len(content_bytes) > 20 * 1024 * 1024:
+        raise HTTPException(400, "File exceeds 20MB limit")
+
+    llm = get_llm_client()
+    extracted = await _extract_data_from_image(
+        llm, content_bytes, file.content_type or "image/png"
+    )
+
+    time_series, cross_section = None, None
+    if extracted.get("data"):
+        try:
+            parsed = _parse_extracted_data(extracted["data"])
+            if extracted.get("data_type") == "time_series":
+                time_series = parsed
+            else:
+                cross_section = parsed
+        except Exception:
+            logger.warning("Could not parse extracted data as numeric arrays")
+
+    engine = ThreeLayerEngine(llm)
+    result = await engine.analyze(
+        time_series=time_series,
+        cross_section=cross_section,
+        context_text=extracted.get("description", "Data extracted from screenshot"),
+        question=question,
+    )
+
+    await _persist_evidence(session, project_id, result)
+
+    # Load existing claims and merge
+    from sqlalchemy import select as sa_select
+    from curiocat.db.models import Claim
+
+    existing_result = await session.execute(
+        sa_select(Claim)
+        .where(Claim.project_id == project_id)
+        .order_by(Claim.order_index)
+    )
+    existing_claims = list(existing_result.scalars().all())
+
+    merger = _build_merger(session)
+    merge_result = await merger.merge_fused_edges(
+        project_id, result.edges, existing_claims
+    )
+
+    await session.commit()
+
+    graph = await _compute_full_graph(project_id, session)
+
+    return EnrichResult(
+        new_nodes=[_claim_to_response(c) for c in merge_result.new_claims],
+        new_edges=[_edge_to_response(e) for e in merge_result.new_edges],
+        merged_nodes=[_claim_to_response(c) for c in merge_result.merged_claims],
+        skipped_duplicates=merge_result.skipped_duplicates,
+        graph=graph,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auto Explore
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/graph/{project_id}/auto-explore",
+    response_model=AutoExploreResult,
+)
+async def auto_explore(
+    project_id: UUID,
+    req: AutoExploreRequest,
+    session: AsyncSession = Depends(get_session),
+) -> AutoExploreResult:
+    """Automatically identify and address graph weaknesses.
+
+    Analyzes the graph for weak edges, leaf nodes, low-confidence roots,
+    and high-sensitivity areas, then runs challenge/expand/trace-back
+    operations to strengthen them.
+    """
+    from curiocat.config import settings
+    from curiocat.llm.client import get_llm_client
+    from curiocat.llm.embeddings import EmbeddingService
+    from curiocat.pipeline.auto_explorer import AutoExplorer
+
+    llm = get_llm_client()
+    embedder = EmbeddingService()
+
+    if settings.brave_search_api_key:
+        from curiocat.evidence.web_search import BraveSearchClient
+        search_client = BraveSearchClient(settings.brave_search_api_key)
+    else:
+        from curiocat.evidence.web_search import DuckDuckGoSearchClient
+        search_client = DuckDuckGoSearchClient()
+
+    explorer = AutoExplorer(session, llm, embedder, search_client)
+
+    try:
+        result = await explorer.explore(
+            project_id, max_new_nodes=req.max_new_nodes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    graph = await _compute_full_graph(project_id, session)
+
+    return AutoExploreResult(
+        weaknesses_found=[
+            WeaknessReport(**w) for w in result.weaknesses_found
+        ],
+        new_nodes=[_claim_to_response(c) for c in result.new_nodes],
+        new_edges=[_edge_to_response(e) for e in result.new_edges],
+        converged_edges=[_edge_to_response(e) for e in result.converged_edges],
+        convergence_reached=result.convergence_reached,
+        graph=graph,
     )
 
 

@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { Search, Filter, Download, Loader2, GitFork, Wifi, WifiOff, Eye, Focus as FocusIcon, ChevronLeft, ChevronRight, Check, Undo2, Info, Shield, Clock } from 'lucide-react'
+import { Search, Filter, Download, Loader2, GitFork, Wifi, WifiOff, Eye, Focus as FocusIcon, ChevronLeft, ChevronRight, Check, Undo2, Info, Shield, Clock, Plus, Sparkles } from 'lucide-react'
 import { toast } from 'sonner'
 import { apiGet, apiPatch } from '../../lib/api/client.ts'
 import { useAnalysis } from '../../context/AnalysisContext.tsx'
@@ -17,6 +17,8 @@ import ClaimsBrowser from './ClaimsBrowser.tsx'
 import ScenarioForge from '../scenario/ScenarioForge.tsx'
 import ExportPanel from '../export/ExportPanel.tsx'
 import StrategicAdvisorPanel from './StrategicAdvisorPanel.tsx'
+import EnrichPanel from './EnrichPanel.tsx'
+import AutoExplorePanel from './AutoExplorePanel.tsx'
 import TimelineView from './TimelineView.tsx'
 import TimeScrubber from './TimeScrubber.tsx'
 import GraphLegend from './GraphLegend.tsx'
@@ -150,7 +152,7 @@ function transformGraph(api: ApiGraph): CausalGraph {
 
 // --- Side panel type ---
 
-type SidePanel = 'none' | 'node' | 'edge' | 'edge-bundle' | 'scenario' | 'export' | 'advisor'
+type SidePanel = 'none' | 'node' | 'edge' | 'edge-bundle' | 'scenario' | 'export' | 'advisor' | 'enrich' | 'auto-explore'
 
 // --- Component ---
 
@@ -448,6 +450,28 @@ export default function GraphScreen() {
     }
   }, [sidePanel, dispatch])
 
+  // Toggle enrich panel
+  const handleToggleEnrich = useCallback(() => {
+    if (sidePanel === 'enrich') {
+      setSidePanel('none')
+    } else {
+      dispatch({ type: 'SELECT_NODE', nodeId: null })
+      dispatch({ type: 'SELECT_EDGE', edgeId: null })
+      setSidePanel('enrich')
+    }
+  }, [sidePanel, dispatch])
+
+  // Toggle auto-explore panel
+  const handleToggleAutoExplore = useCallback(() => {
+    if (sidePanel === 'auto-explore') {
+      setSidePanel('none')
+    } else {
+      dispatch({ type: 'SELECT_NODE', nodeId: null })
+      dispatch({ type: 'SELECT_EDGE', edgeId: null })
+      setSidePanel('auto-explore')
+    }
+  }, [sidePanel, dispatch])
+
   // Navigate to comparison view
   const handleCompare = useCallback((scenarioAId: string, scenarioBId: string) => {
     navigate(`/compare/${projectId}?a=${encodeURIComponent(scenarioAId)}&b=${encodeURIComponent(scenarioBId)}`)
@@ -600,6 +624,32 @@ export default function GraphScreen() {
         {/* Push action buttons to right */}
         <div className="flex-1" />
 
+        {/* Enrich */}
+        <button
+          onClick={handleToggleEnrich}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+            sidePanel === 'enrich'
+              ? 'text-ocean-400 bg-ocean-500/15 border-ocean-500/30'
+              : 'text-text-secondary hover:text-text-primary bg-surface-700 hover:bg-surface-600 border-surface-600'
+          }`}
+        >
+          <Plus className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">{t.enrich?.button ?? 'Enrich'}</span>
+        </button>
+
+        {/* Auto Explore */}
+        <button
+          onClick={handleToggleAutoExplore}
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+            sidePanel === 'auto-explore'
+              ? 'text-ocean-400 bg-ocean-500/15 border-ocean-500/30'
+              : 'text-text-secondary hover:text-text-primary bg-surface-700 hover:bg-surface-600 border-surface-600'
+          }`}
+        >
+          <Sparkles className="w-3.5 h-3.5" />
+          <span className="hidden sm:inline">{t.autoExplore?.button ?? 'Auto Explore'}</span>
+        </button>
+
         {/* Fork Scenario */}
         <button
           onClick={handleToggleScenario}
@@ -745,6 +795,23 @@ export default function GraphScreen() {
                 onAdvise={ops.advise}
                 onAdviseStream={ops.adviseStream}
                 onSuggestPerspectives={ops.suggestPerspectives}
+                operationLoading={operationLoading}
+              />
+            )}
+            {sidePanel === 'enrich' && (
+              <EnrichPanel
+                onClose={handleClosePanel}
+                onEnrichText={ops.enrichText}
+                onEnrichCSV={ops.enrichCSV}
+                onEnrichScreenshot={ops.enrichScreenshot}
+                operationLoading={operationLoading}
+              />
+            )}
+            {sidePanel === 'auto-explore' && (
+              <AutoExplorePanel
+                graph={graph}
+                onClose={handleClosePanel}
+                onAutoExplore={ops.autoExplore}
                 operationLoading={operationLoading}
               />
             )}

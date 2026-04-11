@@ -190,6 +190,50 @@ class SuggestPerspectivesResult(BaseModel):
     suggestions: list[PerspectiveSuggestion]
 
 
+class EnrichTextRequest(BaseModel):
+    """Request to enrich a graph with additional text."""
+
+    text: str = Field(..., min_length=10, max_length=50000)
+    context: str | None = None
+
+
+class EnrichResult(BaseModel):
+    """Result of an enrich operation (text, CSV, or screenshot)."""
+
+    new_nodes: list[ClaimResponse]
+    new_edges: list[EdgeResponse]
+    merged_nodes: list[ClaimResponse]
+    skipped_duplicates: int
+    graph: GraphResponse
+
+
+class AutoExploreRequest(BaseModel):
+    """Request for automatic graph exploration."""
+
+    max_new_nodes: int = Field(10, ge=1, le=30)
+
+
+class WeaknessReport(BaseModel):
+    """Report on a single weakness found and action taken."""
+
+    node_id: str | None = None
+    edge_id: str | None = None
+    weakness_type: str
+    action_taken: str
+    result_summary: str
+
+
+class AutoExploreResult(BaseModel):
+    """Result of automatic graph exploration."""
+
+    weaknesses_found: list[WeaknessReport]
+    new_nodes: list[ClaimResponse]
+    new_edges: list[EdgeResponse]
+    converged_edges: list[EdgeResponse]
+    convergence_reached: bool
+    graph: GraphResponse
+
+
 class AdviseRequest(BaseModel):
     """Request for strategic advisory analysis."""
 

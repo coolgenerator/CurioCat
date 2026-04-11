@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react'
 import { toast } from 'sonner'
-import { apiPost, apiGet } from '../lib/api/client.ts'
+import { apiPost, apiGet, apiPostForm } from '../lib/api/client.ts'
 import { useAnalysis } from '../context/AnalysisContext.tsx'
 import { useT } from '../i18n/index.tsx'
 import { computeVisibleNodes, findTopPaths } from '../lib/graph/focusCompute.ts'
@@ -9,6 +9,8 @@ import type {
   ApiChallengeResult,
   ApiWhatIfResult,
   ApiAdviseResult,
+  ApiEnrichResult,
+  ApiAutoExploreResult,
   ApiSuggestPerspectivesResult,
   WhatIfModification,
 } from '../types/api.ts'
@@ -304,6 +306,133 @@ export function useGraphOperations(projectId: string | null) {
     return () => abortController.abort()
   }, [projectId, dispatch])
 
+  const enrichText = useCallback(async (text: string, context?: string) => {
+    if (!projectId) return null
+    dispatch({ type: 'SET_OPERATION_LOADING', operation: 'enrich' })
+    setError(null)
+    try {
+      const result = await apiPost<ApiEnrichResult>(
+        `/api/v1/graph/${projectId}/enrich/text`,
+        { text, context: context || undefined }
+      )
+      const graph = transformApiGraph(result.graph)
+      dispatch({ type: 'MERGE_GRAPH_UPDATE', graph })
+      toast.success(
+        t.enrich?.success
+          ?.replace('{nodes}', String(result.new_nodes.length))
+          .replace('{edges}', String(result.new_edges.length))
+          ?? `Added ${result.new_nodes.length} nodes, ${result.new_edges.length} edges`
+      )
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Enrich failed'
+      setError(msg)
+      toast.error(msg)
+      dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+      return null
+    }
+  }, [projectId, dispatch, t])
+
+  const enrichCSV = useCallback(async (
+    file: File,
+    question?: string,
+    dataType: string = 'time_series',
+    maxLag: number = 5,
+    alpha: number = 0.05,
+  ) => {
+    if (!projectId) return null
+    dispatch({ type: 'SET_OPERATION_LOADING', operation: 'enrich' })
+    setError(null)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      if (question) form.append('question', question)
+      form.append('data_type', dataType)
+      form.append('max_lag', String(maxLag))
+      form.append('alpha', String(alpha))
+
+      const result = await apiPostForm<ApiEnrichResult>(
+        `/api/v1/graph/${projectId}/enrich/csv`,
+        form,
+      )
+      const graph = transformApiGraph(result.graph)
+      dispatch({ type: 'MERGE_GRAPH_UPDATE', graph })
+      toast.success(
+        t.enrich?.success
+          ?.replace('{nodes}', String(result.new_nodes.length))
+          .replace('{edges}', String(result.new_edges.length))
+          ?? `Added ${result.new_nodes.length} nodes, ${result.new_edges.length} edges`
+      )
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'CSV enrich failed'
+      setError(msg)
+      toast.error(msg)
+      dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+      return null
+    }
+  }, [projectId, dispatch, t])
+
+  const autoExplore = useCallback(async (maxNewNodes: number = 10) => {
+    if (!projectId) return null
+    dispatch({ type: 'SET_OPERATION_LOADING', operation: 'auto-explore' })
+    setError(null)
+    try {
+      const result = await apiPost<ApiAutoExploreResult>(
+        `/api/v1/graph/${projectId}/auto-explore`,
+        { max_new_nodes: maxNewNodes }
+      )
+      const graph = transformApiGraph(result.graph)
+      dispatch({ type: 'MERGE_GRAPH_UPDATE', graph })
+
+      const addressed = result.weaknesses_found.filter(w => w.action_taken !== 'skipped' && w.action_taken !== 'failed').length
+      toast.success(
+        t.autoExplore?.success
+          ?.replace('{weaknesses}', String(addressed))
+          .replace('{nodes}', String(result.new_nodes.length))
+          ?? `Addressed ${addressed} weaknesses, added ${result.new_nodes.length} nodes`
+      )
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Auto explore failed'
+      setError(msg)
+      toast.error(msg)
+      dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+      return null
+    }
+  }, [projectId, dispatch, t])
+
+  const enrichScreenshot = useCallback(async (file: File, question?: string) => {
+    if (!projectId) return null
+    dispatch({ type: 'SET_OPERATION_LOADING', operation: 'enrich' })
+    setError(null)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      if (question) form.append('question', question)
+
+      const result = await apiPostForm<ApiEnrichResult>(
+        `/api/v1/graph/${projectId}/enrich/screenshot`,
+        form,
+      )
+      const graph = transformApiGraph(result.graph)
+      dispatch({ type: 'MERGE_GRAPH_UPDATE', graph })
+      toast.success(
+        t.enrich?.success
+          ?.replace('{nodes}', String(result.new_nodes.length))
+          .replace('{edges}', String(result.new_edges.length))
+          ?? `Added ${result.new_nodes.length} nodes, ${result.new_edges.length} edges`
+      )
+      return result
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Screenshot enrich failed'
+      setError(msg)
+      toast.error(msg)
+      dispatch({ type: 'SET_OPERATION_LOADING', operation: null })
+      return null
+    }
+  }, [projectId, dispatch, t])
+
   return {
     expand,
     traceBack,
@@ -313,6 +442,10 @@ export function useGraphOperations(projectId: string | null) {
     clearFocus,
     clearCompare,
     applyCompare,
+    enrichText,
+    enrichCSV,
+    enrichScreenshot,
+    autoExplore,
     suggestPerspectives,
     advise,
     adviseStream,
