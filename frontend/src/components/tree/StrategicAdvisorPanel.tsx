@@ -1,9 +1,10 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import {
   X, Shield, Loader2, ChevronDown, ChevronRight, ArrowLeft,
-  Sparkles, Tag,
+  Sparkles, Tag, MessageSquare, Trash2, User, Bot,
   AlertTriangle, TrendingUp, ListChecks, Siren, Activity,
 } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
 import { useT } from '../../i18n/index.tsx'
 import type { ApiAdviseResult, ApiPerspectiveSuggestion } from '../../types/api.ts'
 
@@ -89,8 +90,20 @@ interface ChatMessage {
   tags?: string[]
 }
 
+interface SessionInfo {
+  id: string
+  title: string
+  message_count: number
+  created_at: string | null
+}
+
 export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, onAdviseStream, onSuggestPerspectives, operationLoading }: Props) {
   const { t } = useT()
+  // Session management
+  const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+  const [sessionsLoading, setSessionsLoading] = useState(true)
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputText, setInputText] = useState('')
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set())
@@ -106,16 +119,37 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
   const isLoading = operationLoading === 'advise'
   const isFirstMessage = messages.length === 0
 
-  // Load conversation history from DB on mount
+  // Load sessions list on mount
   useEffect(() => {
     if (!projectId) return
     let cancelled = false
-    async function loadHistory() {
+    async function loadSessions() {
+      setSessionsLoading(true)
       try {
-        const res = await fetch(`/api/v1/graph/${projectId}/advisor-messages`)
+        const res = await fetch(`/api/v1/graph/${projectId}/advisor-sessions`)
         if (!res.ok) return
         const data = await res.json()
-        if (!cancelled && Array.isArray(data) && data.length > 0) {
+        if (!cancelled) setSessions(data)
+      } catch { /* ignore */ }
+      if (!cancelled) setSessionsLoading(false)
+    }
+    void loadSessions()
+    return () => { cancelled = true }
+  }, [projectId])
+
+  // Load messages when active session changes
+  useEffect(() => {
+    if (!projectId || !activeSessionId) {
+      setMessages([])
+      return
+    }
+    let cancelled = false
+    async function loadMessages() {
+      try {
+        const res = await fetch(`/api/v1/graph/${projectId}/advisor-sessions/${activeSessionId}/messages`)
+        if (!res.ok) return
+        const data = await res.json()
+        if (!cancelled && Array.isArray(data)) {
           setMessages(data.map((m: { role: string; content: string; tags?: string[] }) => ({
             role: m.role as 'user' | 'assistant',
             content: m.content,
@@ -124,9 +158,44 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
         }
       } catch { /* ignore */ }
     }
-    void loadHistory()
+    void loadMessages()
     return () => { cancelled = true }
+  }, [projectId, activeSessionId])
+
+  // Create a new session and enter it
+  const handleNewSession = useCallback(async () => {
+    if (!projectId) return
+    try {
+      const res = await fetch(`/api/v1/graph/${projectId}/advisor-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'New conversation' }),
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      const newSession: SessionInfo = {
+        id: data.id,
+        title: data.title,
+        message_count: 0,
+        created_at: new Date().toISOString(),
+      }
+      setSessions(prev => [newSession, ...prev])
+      setActiveSessionId(data.id)
+    } catch { /* ignore */ }
   }, [projectId])
+
+  // Delete a session
+  const handleDeleteSession = useCallback(async (sessionId: string) => {
+    if (!projectId) return
+    try {
+      await fetch(`/api/v1/graph/${projectId}/advisor-sessions/${sessionId}`, { method: 'DELETE' })
+      setSessions(prev => prev.filter(s => s.id !== sessionId))
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null)
+        setMessages([])
+      }
+    } catch { /* ignore */ }
+  }, [projectId, activeSessionId])
 
   // Auto-fetch suggestions when panel opens
   useEffect(() => {
@@ -158,29 +227,64 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
     }
   }, [])
 
-  // Persist a message to the backend
+  // Persist a message to the backend via session
   const saveMessage = useCallback((role: string, content: string, tags?: string[]) => {
-    if (!projectId || !content) return
-    fetch(`/api/v1/graph/${projectId}/advisor-messages`, {
+    if (!projectId || !activeSessionId || !content) return
+    fetch(`/api/v1/graph/${projectId}/advisor-sessions/${activeSessionId}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ role, content, tags }),
+    }).then(() => {
+      // Update session title and count in the list
+      if (role === 'user') {
+        setSessions(prev => prev.map(s =>
+          s.id === activeSessionId
+            ? { ...s, title: s.title === 'New conversation' ? content.slice(0, 80) : s.title, message_count: s.message_count + 1 }
+            : s
+        ))
+      }
     }).catch(() => { /* silent */ })
-  }, [projectId])
+  }, [projectId, activeSessionId])
 
   // Ref to accumulate assistant response for persistence
   const assistantBufferRef = useRef('')
 
-  const handleSend = useCallback(() => {
+  const handleSend = useCallback(async () => {
     const text = inputText.trim()
     if (text.length < 10 || isLoading) return
 
     const tags = Array.from(selectedTags)
 
+    // Auto-create session if none active
+    let sessionId = activeSessionId
+    if (!sessionId) {
+      try {
+        const res = await fetch(`/api/v1/graph/${projectId}/advisor-sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: text.slice(0, 80) }),
+        })
+        if (res.ok) {
+          const data = await res.json()
+          sessionId = data.id
+          setActiveSessionId(sessionId)
+          setSessions(prev => [{ id: data.id, title: data.title, message_count: 0, created_at: new Date().toISOString() }, ...prev])
+        }
+      } catch { /* ignore */ }
+    }
+
     // Add user message and save to DB
     setMessages(prev => [...prev, { role: 'user', content: text, tags }])
-    saveMessage('user', text, tags)
     setInputText('')
+
+    // Save user message (uses updated activeSessionId via closure)
+    if (sessionId) {
+      fetch(`/api/v1/graph/${projectId}/advisor-sessions/${sessionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: 'user', content: text, tags }),
+      }).catch(() => {})
+    }
 
     // Add placeholder assistant message
     assistantBufferRef.current = ''
@@ -188,6 +292,7 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
 
     setTimeout(scrollToBottom, 50)
 
+    const finalSessionId = sessionId
     const cancel = onAdviseStream(
       text,
       tags,
@@ -205,7 +310,13 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
       },
       () => {
         // Streaming done — save full assistant response to DB
-        saveMessage('assistant', assistantBufferRef.current)
+        if (finalSessionId) {
+          fetch(`/api/v1/graph/${projectId}/advisor-sessions/${finalSessionId}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role: 'assistant', content: assistantBufferRef.current }),
+          }).catch(() => {})
+        }
       },
       (msg) => {
         assistantBufferRef.current += `\n\n**Error:** ${msg}`
@@ -217,11 +328,11 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
           }
           return updated
         })
-        saveMessage('assistant', assistantBufferRef.current)
       },
+      finalSessionId ?? undefined,
     )
     cancelStreamRef.current = cancel
-  }, [inputText, selectedTags, isLoading, onAdviseStream, scrollToBottom, saveMessage])
+  }, [inputText, selectedTags, isLoading, activeSessionId, projectId, onAdviseStream, scrollToBottom])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -235,92 +346,211 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
     return () => { cancelStreamRef.current?.() }
   }, [])
 
-  // --- Chat-based UI ---
+  // --- Session list view (no active session) ---
+  if (!activeSessionId) {
+    return (
+      <div className="flex flex-col h-full bg-surface-800">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700">
+          <div className="flex items-center gap-2">
+            <Shield className="w-4 h-4 text-ocean-400" />
+            <h2 className="text-sm font-semibold text-text-primary">{t.advisor.title}</h2>
+          </div>
+          <button onClick={onClose} className="p-1 rounded hover:bg-surface-700 text-text-muted hover:text-text-primary transition-colors">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+          {/* New chat button */}
+          <button
+            onClick={handleNewSession}
+            className="w-full flex items-center gap-2 px-3 py-2.5 text-sm rounded-lg border border-dashed border-ocean-500/40 text-ocean-400 hover:bg-ocean-500/10 transition-colors"
+          >
+            <Sparkles className="w-4 h-4" />
+            New Conversation
+          </button>
+
+          {/* Perspective tags for new conversations */}
+          {!suggestionsLoading && suggestions.length > 0 && (
+            <div className="pt-2">
+              <div className="flex items-center gap-1.5 mb-1.5">
+                <Tag className="w-3 h-3 text-text-muted" />
+                <label className="text-xs font-medium text-text-secondary">{t.advisor.perspectiveLabel}</label>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {suggestions.map((s) => {
+                  const selected = selectedTags.has(s.label)
+                  return (
+                    <button
+                      key={s.label}
+                      onClick={() => toggleTag(s.label)}
+                      title={s.description}
+                      className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg border transition-colors ${
+                        selected
+                          ? 'text-ocean-400 bg-ocean-500/15 border-ocean-500/30'
+                          : 'text-text-muted hover:text-text-secondary bg-surface-700 hover:bg-surface-600 border-surface-600'
+                      }`}
+                    >
+                      <Tag className="w-3 h-3" />
+                      {s.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Session history */}
+          {sessionsLoading ? (
+            <div className="flex items-center gap-2 py-4">
+              <Loader2 className="w-4 h-4 text-text-muted animate-spin" />
+              <span className="text-xs text-text-muted">Loading conversations...</span>
+            </div>
+          ) : sessions.length > 0 && (
+            <div className="pt-3">
+              <h3 className="text-xs font-medium text-text-muted mb-2">Previous Conversations</h3>
+              <div className="space-y-1">
+                {sessions.map((s) => (
+                  <div key={s.id} className="group flex items-center gap-2 p-2 rounded-lg hover:bg-surface-700/60 border border-transparent hover:border-surface-600/50 transition-all cursor-pointer"
+                    onClick={() => setActiveSessionId(s.id)}
+                  >
+                    <div className="shrink-0 w-8 h-8 rounded-lg bg-surface-700 flex items-center justify-center">
+                      <MessageSquare className="w-3.5 h-3.5 text-ocean-400" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm text-text-secondary group-hover:text-text-primary truncate transition-colors">{s.title}</div>
+                      <div className="text-[10px] text-text-muted mt-0.5">
+                        {s.message_count} messages
+                      </div>
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleDeleteSession(s.id) }}
+                      className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-surface-600 text-text-muted hover:text-red-400 transition-all"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Quick start input */}
+        <div className="px-3 py-3 border-t border-surface-700">
+          <div className="flex gap-2">
+            <textarea
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={t.advisor.contextPlaceholder}
+              rows={2}
+              className="flex-1 px-3 py-2 text-sm bg-surface-700 border border-surface-600 rounded-lg text-text-primary placeholder-text-muted focus:outline-none focus:border-ocean-500 transition-colors resize-none"
+            />
+            <button
+              onClick={handleSend}
+              disabled={inputText.trim().length < 10 || isLoading}
+              className="px-3 py-2 rounded-lg bg-ocean-500 text-white hover:bg-ocean-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors self-end"
+            >
+              <Shield className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // --- Active session chat view ---
   return (
     <div className="flex flex-col h-full bg-surface-800">
-      {/* Header */}
+      {/* Header with back button */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-surface-700">
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => { cancelStreamRef.current?.(); setActiveSessionId(null) }}
+            className="p-1 rounded hover:bg-surface-700 text-text-muted hover:text-text-primary transition-colors"
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </button>
           <Shield className="w-4 h-4 text-ocean-400" />
-          <h2 className="text-sm font-semibold text-text-primary">{t.advisor.title}</h2>
+          <h2 className="text-sm font-semibold text-text-primary truncate max-w-[200px]">
+            {sessions.find(s => s.id === activeSessionId)?.title || t.advisor.title}
+          </h2>
         </div>
         <button onClick={onClose} className="p-1 rounded hover:bg-surface-700 text-text-muted hover:text-text-primary transition-colors">
           <X className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Chat messages area */}
+      {/* Chat messages */}
       <div ref={chatContainerRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
-        {/* Empty state: perspective suggestions */}
-        {isFirstMessage && (
-          <div className="space-y-3">
-            <p className="text-xs text-text-muted">{t.advisor.contextHint}</p>
-            {/* Perspective tags */}
-            {suggestionsLoading ? (
-              <div className="flex items-center gap-2 py-2">
-                <Loader2 className="w-3.5 h-3.5 text-text-muted animate-spin" />
-                <span className="text-xs text-text-muted">{t.advisor.loadingSuggestions}</span>
-              </div>
-            ) : suggestions.length > 0 && (
-              <div>
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <Sparkles className="w-3 h-3 text-ocean-400" />
-                  <label className="text-xs font-medium text-text-secondary">{t.advisor.perspectiveLabel}</label>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {suggestions.map((s) => {
-                    const selected = selectedTags.has(s.label)
-                    return (
-                      <button
-                        key={s.label}
-                        onClick={() => toggleTag(s.label)}
-                        title={s.description}
-                        className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg border transition-colors ${
-                          selected
-                            ? 'text-ocean-400 bg-ocean-500/15 border-ocean-500/30'
-                            : 'text-text-muted hover:text-text-secondary bg-surface-700 hover:bg-surface-600 border-surface-600'
-                        }`}
-                      >
-                        <Tag className="w-3 h-3" />
-                        {s.label}
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
+        {messages.length === 0 && (
+          <p className="text-xs text-text-muted text-center py-8">Start a conversation by typing below.</p>
         )}
 
-        {/* Message thread */}
         {messages.map((msg, i) => (
-          <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${
+          <div key={i} className={`flex gap-2.5 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+            {/* Avatar */}
+            <div className={`shrink-0 w-7 h-7 rounded-full flex items-center justify-center mt-0.5 ${
+              msg.role === 'user' ? 'bg-ocean-500/20' : 'bg-emerald-500/20'
+            }`}>
+              {msg.role === 'user'
+                ? <User className="w-3.5 h-3.5 text-ocean-400" />
+                : <Bot className="w-3.5 h-3.5 text-emerald-400" />
+              }
+            </div>
+
+            {/* Message bubble */}
+            <div className={`max-w-[85%] rounded-xl px-3.5 py-2.5 text-sm ${
               msg.role === 'user'
-                ? 'bg-ocean-500/20 text-text-primary border border-ocean-500/30'
-                : 'bg-surface-700 text-text-secondary'
+                ? 'bg-ocean-500/15 text-text-primary border border-ocean-500/20'
+                : 'bg-surface-700/80 text-text-secondary border border-surface-600/50'
             }`}>
               {msg.role === 'user' && msg.tags && msg.tags.length > 0 && (
-                <div className="flex flex-wrap gap-1 mb-1.5">
+                <div className="flex flex-wrap gap-1 mb-2">
                   {msg.tags.map(tag => (
-                    <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded bg-ocean-500/10 text-ocean-400">
+                    <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded-full bg-ocean-500/10 text-ocean-400 border border-ocean-500/20">
                       {tag}
                     </span>
                   ))}
                 </div>
               )}
-              <div className="whitespace-pre-wrap leading-relaxed">
-                {msg.content}
-                {msg.role === 'assistant' && isLoading && i === messages.length - 1 && (
-                  <span className="inline-block w-2 h-4 bg-ocean-400 animate-pulse ml-0.5" />
-                )}
-              </div>
+              {msg.role === 'assistant' ? (
+                <div className="advisor-markdown">
+                  <ReactMarkdown
+                    components={{
+                      h2: ({ children }) => <h2 className="text-sm font-semibold text-text-primary mt-3 mb-1.5 first:mt-0">{children}</h2>,
+                      h3: ({ children }) => <h3 className="text-xs font-semibold text-text-primary mt-2 mb-1">{children}</h3>,
+                      p: ({ children }) => <p className="text-sm text-text-secondary leading-relaxed mb-2 last:mb-0">{children}</p>,
+                      ul: ({ children }) => <ul className="text-sm text-text-secondary space-y-1 mb-2 pl-4 list-disc">{children}</ul>,
+                      ol: ({ children }) => <ol className="text-sm text-text-secondary space-y-1 mb-2 pl-4 list-decimal">{children}</ol>,
+                      li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                      strong: ({ children }) => <strong className="font-semibold text-text-primary">{children}</strong>,
+                      em: ({ children }) => <em className="text-ocean-300">{children}</em>,
+                      code: ({ children }) => <code className="text-xs bg-surface-600 px-1.5 py-0.5 rounded text-emerald-300">{children}</code>,
+                      blockquote: ({ children }) => <blockquote className="border-l-2 border-ocean-500/40 pl-3 my-2 text-text-muted italic">{children}</blockquote>,
+                      table: ({ children }) => <div className="overflow-x-auto my-2"><table className="text-xs w-full border-collapse">{children}</table></div>,
+                      th: ({ children }) => <th className="border border-surface-600 px-2 py-1 bg-surface-600/50 text-text-primary text-left font-medium">{children}</th>,
+                      td: ({ children }) => <td className="border border-surface-600 px-2 py-1 text-text-secondary">{children}</td>,
+                      hr: () => <hr className="border-surface-600 my-3" />,
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                  {isLoading && i === messages.length - 1 && (
+                    <span className="inline-block w-2 h-4 bg-ocean-400 animate-pulse ml-0.5 rounded-sm" />
+                  )}
+                </div>
+              ) : (
+                <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
+              )}
             </div>
           </div>
         ))}
       </div>
 
-      {/* Input area — always visible at bottom */}
+      {/* Input area */}
       <div className="px-3 py-3 border-t border-surface-700">
         <div className="flex gap-2">
           <textarea
@@ -328,7 +558,7 @@ export default function StrategicAdvisorPanel({ projectId, onClose, onAdvise, on
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isFirstMessage ? t.advisor.contextPlaceholder : 'Ask a follow-up question...'}
+            placeholder="Ask a follow-up question..."
             rows={2}
             className="flex-1 px-3 py-2 text-sm bg-surface-700 border border-surface-600 rounded-lg text-text-primary placeholder-text-muted focus:outline-none focus:border-ocean-500 transition-colors resize-none"
           />

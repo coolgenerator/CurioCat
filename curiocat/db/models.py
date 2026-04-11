@@ -249,19 +249,42 @@ class EventTimeline(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AdvisorSession(Base):
+    """A conversation session within the Strategic Advisor."""
+
+    __tablename__ = "advisor_session"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE")
+    )
+    title: Mapped[str] = mapped_column(String(500), default="New conversation")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), nullable=True
+    )
+
+    messages: Mapped[list["AdvisorMessage"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan",
+        order_by="AdvisorMessage.created_at",
+    )
+
+
 class AdvisorMessage(Base):
     """Persisted advisor conversation messages."""
 
     __tablename__ = "advisor_message"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("project.id", ondelete="CASCADE")
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("advisor_session.id", ondelete="CASCADE")
     )
     role: Mapped[str] = mapped_column(String(20))  # "user" or "assistant"
     content: Mapped[str] = mapped_column(Text)
     tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    session: Mapped["AdvisorSession"] = relationship(back_populates="messages")
 
 
 class MetricSeries(Base):

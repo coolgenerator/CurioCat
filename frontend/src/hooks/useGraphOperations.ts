@@ -242,17 +242,17 @@ export function useGraphOperations(projectId: string | null) {
     onToken: (text: string) => void,
     onComplete: () => void,
     onError: (msg: string) => void,
+    sessionId?: string,
   ): (() => void) => {
     if (!projectId) return () => {}
     dispatch({ type: 'SET_OPERATION_LOADING', operation: 'advise' })
 
-    // POST the request body, then read the SSE stream from the response
     const abortController = new AbortController()
 
     fetch(`/api/v1/graph/${projectId}/advise/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_context: userContext, perspective_tags: perspectiveTags }),
+      body: JSON.stringify({ user_context: userContext, perspective_tags: perspectiveTags, session_id: sessionId ?? null }),
       signal: abortController.signal,
     })
       .then(async (res) => {

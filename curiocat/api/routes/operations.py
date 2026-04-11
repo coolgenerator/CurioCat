@@ -458,14 +458,38 @@ async def advise_stream(
     from curiocat.llm.client import get_llm_client
     from curiocat.llm.prompts.strategic_advisor import STRATEGIC_ADVISOR_SYSTEM
 
-    user_msg = await _build_advise_prompt(project_id, req, session)
+    graph_context = await _build_advise_prompt(project_id, req, session)
+
+    # Build conversation history from session (if provided)
+    conversation_history = ""
+    if req.session_id:
+        from sqlalchemy import select
+        from curiocat.db.models import AdvisorMessage
+        result = await session.execute(
+            select(AdvisorMessage)
+            .where(AdvisorMessage.session_id == UUID(req.session_id))
+            .order_by(AdvisorMessage.created_at)
+        )
+        prev_messages = result.scalars().all()
+        if prev_messages:
+            history_parts = []
+            for m in prev_messages:
+                prefix = "User" if m.role == "user" else "Advisor"
+                history_parts.append(f"**{prefix}:** {m.content}")
+            conversation_history = (
+                "\n\n## Previous Conversation\n"
+                + "\n\n".join(history_parts)
+                + "\n\n---\n"
+            )
+
+    user_msg = graph_context + conversation_history + f"\n\n## Current Question\n{req.user_context}"
 
     # Use plain text streaming (not JSON schema) for real-time output
     streaming_system = (
         STRATEGIC_ADVISOR_SYSTEM
         + "\n\nIMPORTANT: Output your analysis as well-structured markdown. "
-        "Use ## headings for sections: Impact Assessment, Predictions, "
-        "Recommended Actions, Escalation Scenarios, Key Indicators."
+        "Use ## headings for sections. If this is a follow-up question, "
+        "build on the previous conversation context."
     )
 
     llm = get_llm_client(enable_cache=False)
@@ -525,20 +549,96 @@ async def _build_advise_prompt(
     )
 
 
-# --- Advisor conversation history ---
+# --- Advisor sessions & messages ---
 
-@router.get("/graph/{project_id}/advisor-messages")
-async def get_advisor_messages(
+@router.get("/graph/{project_id}/advisor-sessions")
+async def list_advisor_sessions(
     project_id: UUID,
     session: AsyncSession = Depends(get_session),
 ):
-    """Load persisted advisor conversation for a project."""
+    """List all advisor conversation sessions for a project."""
+    from sqlalchemy import select, func as sa_func
+    from curiocat.db.models import AdvisorSession, AdvisorMessage
+
+    result = await session.execute(
+        select(
+            AdvisorSession,
+            sa_func.count(AdvisorMessage.id).label("message_count"),
+        )
+        .outerjoin(AdvisorMessage, AdvisorMessage.session_id == AdvisorSession.id)
+        .where(AdvisorSession.project_id == project_id)
+        .group_by(AdvisorSession.id)
+        .order_by(AdvisorSession.updated_at.desc().nullslast(), AdvisorSession.created_at.desc())
+    )
+    rows = result.all()
+
+    return [
+        {
+            "id": str(s.id),
+            "title": s.title,
+            "message_count": count,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        }
+        for s, count in rows
+    ]
+
+
+@router.post("/graph/{project_id}/advisor-sessions")
+async def create_advisor_session(
+    project_id: UUID,
+    body: dict,
+    session: AsyncSession = Depends(get_session),
+):
+    """Create a new advisor conversation session."""
+    from curiocat.db.models import AdvisorSession
+
+    s = AdvisorSession(
+        project_id=project_id,
+        title=body.get("title", "New conversation"),
+    )
+    session.add(s)
+    await session.commit()
+    await session.refresh(s)
+
+    return {"id": str(s.id), "title": s.title}
+
+
+@router.delete("/graph/{project_id}/advisor-sessions/{session_id}")
+async def delete_advisor_session(
+    project_id: UUID,
+    session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Delete an advisor session and all its messages."""
+    from curiocat.db.models import AdvisorSession
+
+    s = await session.get(AdvisorSession, session_id)
+    if s is None or s.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    await session.delete(s)
+    await session.commit()
+    return {"status": "deleted"}
+
+
+@router.get("/graph/{project_id}/advisor-sessions/{session_id}/messages")
+async def get_session_messages(
+    project_id: UUID,
+    session_id: UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Load all messages for a specific advisor session."""
     from sqlalchemy import select
-    from curiocat.db.models import AdvisorMessage
+    from curiocat.db.models import AdvisorMessage, AdvisorSession
+
+    # Verify session belongs to project
+    s = await session.get(AdvisorSession, session_id)
+    if s is None or s.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Session not found")
 
     result = await session.execute(
         select(AdvisorMessage)
-        .where(AdvisorMessage.project_id == project_id)
+        .where(AdvisorMessage.session_id == session_id)
         .order_by(AdvisorMessage.created_at)
     )
     messages = result.scalars().all()
@@ -555,23 +655,35 @@ async def get_advisor_messages(
     ]
 
 
-@router.post("/graph/{project_id}/advisor-messages")
-async def save_advisor_message(
+@router.post("/graph/{project_id}/advisor-sessions/{session_id}/messages")
+async def save_session_message(
     project_id: UUID,
+    session_id: UUID,
     body: dict,
     session: AsyncSession = Depends(get_session),
 ):
-    """Save a single advisor message (user or assistant)."""
-    from curiocat.db.models import AdvisorMessage
+    """Save a message to an advisor session."""
+    from curiocat.db.models import AdvisorMessage, AdvisorSession
+
+    s = await session.get(AdvisorSession, session_id)
+    if s is None or s.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Session not found")
 
     msg = AdvisorMessage(
-        project_id=project_id,
+        session_id=session_id,
         role=body["role"],
         content=body["content"],
         tags=body.get("tags"),
     )
     session.add(msg)
-    await session.commit()
-    await session.refresh(msg)
 
+    # Auto-title: set session title from first user message
+    if s.title == "New conversation" and body["role"] == "user":
+        s.title = body["content"][:80]
+
+    # Touch updated_at
+    from sqlalchemy import func as sa_func
+    s.updated_at = sa_func.now()
+
+    await session.commit()
     return {"id": str(msg.id), "status": "saved"}

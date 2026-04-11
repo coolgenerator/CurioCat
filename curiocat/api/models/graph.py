@@ -195,6 +195,7 @@ class AdviseRequest(BaseModel):
 
     user_context: str = Field(..., min_length=10, max_length=5000)
     perspective_tags: list[str] = []
+    session_id: str | None = None
 
 
 class DirectImpact(BaseModel):
