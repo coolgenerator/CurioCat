@@ -20,6 +20,7 @@ export function computeDepths(
 
   for (const edge of edges) {
     if (!nodeSet.has(edge.sourceId) || !nodeSet.has(edge.targetId)) continue
+    if (edge.isFeedback) continue  // Skip feedback edges to preserve DAG
     adjacency.get(edge.sourceId)!.push(edge.targetId)
     reverseAdj.get(edge.targetId)!.push(edge.sourceId)
   }
@@ -101,6 +102,7 @@ export function computeCumulativeTime(
 
   for (const edge of edges) {
     if (!nodeSet.has(edge.sourceId) || !nodeSet.has(edge.targetId)) continue
+    if (edge.isFeedback) continue  // Skip feedback edges to preserve DAG
     adjacency.get(edge.sourceId)!.push(edge.targetId)
     reverseAdj.get(edge.targetId)!.push(edge.sourceId)
     edgeLookup.set(`${edge.sourceId}->${edge.targetId}`, edge)
@@ -201,6 +203,7 @@ export function computeTemporalBeliefs(
 
   for (const edge of edges) {
     if (!nodeSet.has(edge.sourceId) || !nodeSet.has(edge.targetId)) continue
+    if (edge.isFeedback) continue  // Skip feedback edges to preserve DAG
     adjacency.get(edge.sourceId)!.push(edge.targetId)
     reverseAdj.get(edge.targetId)!.push(edge.sourceId)
     edgesByTarget.get(edge.targetId)!.push(edge)

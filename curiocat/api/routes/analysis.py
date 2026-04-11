@@ -32,7 +32,7 @@ from curiocat.api.models.analysis import (
 from curiocat.config import settings
 from curiocat.db.models import Claim, Project
 from curiocat.db.session import async_session, get_session
-from curiocat.evidence.web_search import BraveSearchClient
+from curiocat.evidence.web_search import BraveSearchClient, DuckDuckGoSearchClient
 from curiocat.llm.client import get_llm_client
 from curiocat.llm.embeddings import EmbeddingService
 from curiocat.pipeline.orchestrator import CausalPipeline, PipelineEvent
@@ -82,9 +82,13 @@ async def _run_pipeline(project_id: str, text: str) -> None:
             llm_client = get_llm_client()
             embedding_service = EmbeddingService()
 
-            search_client: BraveSearchClient | None = None
+            # Default to DuckDuckGo (free, no API key needed).
+            # Falls back to Brave Search if a Brave API key is configured.
+            search_client: DuckDuckGoSearchClient | BraveSearchClient
             if settings.brave_search_api_key:
                 search_client = BraveSearchClient(settings.brave_search_api_key)
+            else:
+                search_client = DuckDuckGoSearchClient()
 
             pipeline = CausalPipeline(
                 session=session,
@@ -262,6 +266,39 @@ async def start_analysis(
     _pipeline_logs[project_id_str] = _PipelineEventLog()
 
     background_tasks.add_task(_run_pipeline, project_id_str, req.text)
+
+    return AnalyzeResponse(project_id=project.id, status="processing")
+
+
+@router.post("/analyze/{project_id}/resume", response_model=AnalyzeResponse)
+async def resume_analysis(
+    project_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+) -> AnalyzeResponse:
+    """Resume a failed pipeline from its last checkpoint.
+
+    Loads existing claims/edges from the database and skips
+    already-completed stages.
+    """
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status == "processing":
+        raise HTTPException(status_code=409, detail="Pipeline is already running")
+
+    if project.status == "completed" and project.last_completed_stage == "belief_propagation":
+        raise HTTPException(status_code=409, detail="Pipeline already completed")
+
+    # Reset status to processing
+    project.status = "processing"
+    await session.commit()
+
+    project_id_str = str(project_id)
+    _pipeline_logs[project_id_str] = _PipelineEventLog()
+
+    background_tasks.add_task(_run_pipeline, project_id_str, project.input_text)
 
     return AnalyzeResponse(project_id=project.id, status="processing")
 

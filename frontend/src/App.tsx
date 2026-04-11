@@ -11,6 +11,7 @@ import GraphScreen from './components/tree/GraphScreen.tsx'
 import GraphListScreen from './components/tree/GraphListScreen.tsx'
 import ComparisonView from './components/scenario/ComparisonView.tsx'
 import ReportsScreen from './components/scenario/ReportsScreen.tsx'
+import CausalAnalysisScreen from './components/input/CausalAnalysisScreen.tsx'
 
 function AppContent() {
   const { theme } = useTheme()
@@ -70,6 +71,14 @@ function AppContent() {
               element={
                 <AppLayout>
                   <ComparisonView />
+                </AppLayout>
+              }
+            />
+            <Route
+              path="/causal"
+              element={
+                <AppLayout>
+                  <CausalAnalysisScreen />
                 </AppLayout>
               }
             />

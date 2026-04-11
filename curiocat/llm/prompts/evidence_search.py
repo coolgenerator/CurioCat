@@ -52,3 +52,56 @@ EVIDENCE_RELEVANCE_SCHEMA = {
     "required": ["relevance_score", "is_supporting", "summary"],
     "additionalProperties": False,
 }
+
+# --- Batched evidence scoring (all snippets for one edge in a single LLM call) ---
+
+EVIDENCE_BATCH_RELEVANCE_SYSTEM = """\
+You are evaluating multiple evidence snippets against a single causal claim.
+
+You will be given:
+- A CAUSAL CLAIM describing a cause-and-effect relationship.
+- Multiple EVIDENCE SNIPPETS, each with an index number.
+
+For EACH snippet, assess:
+1. **Relevance score** (0.0 to 1.0): How directly it relates to the causal claim.
+2. **Supporting or contradicting**: Does it support or contradict the claim?
+3. **Summary**: One-sentence summary of how it relates to the claim.
+
+Be objective and critical. Do not assume evidence supports a claim merely because \
+it mentions the same topic."""
+
+EVIDENCE_BATCH_RELEVANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "The snippet index number (starting from 0).",
+                    },
+                    "relevance_score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "How directly the evidence relates to the causal claim.",
+                    },
+                    "is_supporting": {
+                        "type": "boolean",
+                        "description": "True if the evidence supports the causal claim.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-sentence summary of how the evidence relates to the claim.",
+                    },
+                },
+                "required": ["index", "relevance_score", "is_supporting", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["results"],
+    "additionalProperties": False,
+}

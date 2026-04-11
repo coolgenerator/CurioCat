@@ -117,7 +117,7 @@ def propagate_beliefs(graph: nx.DiGraph) -> nx.DiGraph:
 
             graph.nodes[node_id]["belief"] = belief
 
-    logger.info("Belief propagation complete for %d nodes", len(topo_order))
+    logger.debug("Belief propagation complete for %d nodes", len(topo_order))
     return graph
 
 

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { X, ExternalLink, ArrowRight, ArrowLeft, Loader2, Shield, AlertTriangle, Clock, ChevronDown, ChevronUp } from 'lucide-react'
+import { X, ExternalLink, ArrowRight, ArrowLeft, Loader2, Shield, AlertTriangle, Clock, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
 import type { CausalGraph, Evidence } from '../../types/graph.ts'
 import { useT } from '../../i18n/index.tsx'
 import { CAUSAL_TYPE_META, CONDITION_TYPE_LABELS, BIAS_SEVERITY_COLORS, SOURCE_TIER_LABELS } from '../../lib/visualConstants.ts'
@@ -71,6 +71,16 @@ export default function EvidencePanel({
           showMoreLabel={t.evidence.showMore}
           showLessLabel={t.evidence.showLess}
         />
+
+        {/* Feedback edge notice */}
+        {edge.isFeedback && (
+          <div className="flex items-start gap-1.5 px-3 py-2 rounded-lg bg-purple-500/10 border border-purple-500/20">
+            <RefreshCw className="w-3.5 h-3.5 text-purple-400 mt-0.5 shrink-0" />
+            <span className="text-xs text-purple-300">
+              This edge forms a feedback loop and is excluded from belief propagation, but represents a real causal relationship.
+            </span>
+          </div>
+        )}
 
         {/* Causal type + condition type */}
         <div>

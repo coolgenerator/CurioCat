@@ -134,11 +134,15 @@ export function useForceLayout(
       const cIds = (childIds.get(id) ?? []).filter((cid) => visibleNodeIds.has(cid))
       const isConvergence = pIds.length > 1
 
+      // Spread initial positions more to give the simulation a better start
+      const jitterX = (Math.random() - 0.5) * 200
+      const jitterY = (Math.random() - 0.5) * 100
+
       forceNodes.push({
         id,
         data: nodeData,
-        x: spreadX + widthRef.current / 2,
-        y: d * DEPTH_BAND_HEIGHT + 80,
+        x: spreadX + widthRef.current / 2 + jitterX,
+        y: d * DEPTH_BAND_HEIGHT + 80 + jitterY,
         fx: null,
         fy: null,
         vx: 0,
@@ -211,19 +215,28 @@ export function useForceLayout(
       simulationRef.current.stop()
     }
 
+    // Scale forces based on graph density to avoid overlapping nodes
+    const nodeCount = forceNodes.length
+    const edgeCount = forceLinks.length
+    const density = nodeCount > 1 ? edgeCount / nodeCount : 0
+    const scaleFactor = Math.max(1, Math.sqrt(nodeCount / 10))
+    const linkDist = Math.round(80 * scaleFactor)
+    const chargeStr = Math.round(-200 * scaleFactor)
+    const chargeMax = Math.round(400 * scaleFactor)
+
     const sim = forceSimulation<ForceNode>(forceNodes)
       .force(
         'link',
         forceLink<ForceNode, ForceLink>(forceLinks)
           .id((d) => d.id)
-          .distance(80)
-          .strength(0.3),
+          .distance(linkDist)
+          .strength(density > 2 ? 0.15 : 0.3),
       )
       .force(
         'charge',
         forceManyBody<ForceNode>()
-          .strength(-200)
-          .distanceMax(400),
+          .strength(chargeStr)
+          .distanceMax(chargeMax),
       )
       .force(
         'collide',
@@ -251,8 +264,9 @@ export function useForceLayout(
           .x(widthRef.current / 2)
           .strength(0.12),
       )
-      .alphaDecay(0.05)
-      .velocityDecay(0.4)
+      .alpha(1)
+      .alphaDecay(0.02)
+      .velocityDecay(0.3)
       .on('tick', () => {
         onTickRef.current?.()
       })

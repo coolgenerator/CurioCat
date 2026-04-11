@@ -11,11 +11,14 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
     llm_model: str = "gpt-4o"
     openai_api_key: str = ""
+    openai_base_url: str = ""
     anthropic_api_key: str = ""
 
-    # Embeddings
+    # Embeddings (uses separate base URL since proxies often don't support embedding models)
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    embedding_api_key: str = ""
+    embedding_base_url: str = ""
 
     # Search
     brave_search_api_key: str = ""

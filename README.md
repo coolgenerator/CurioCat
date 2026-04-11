@@ -42,10 +42,14 @@ CurioCat processes input through a multi-layer pipeline:
 
 Discovery repeats (up to 3 layers by default) until convergence: fewer than 2 new claims and fewer than 1 new edge, or the layer budget is exhausted.
 
+**Statistical Validation** (when numeric data is available):
+
+7. **Statistical Validation** — If the user uploads CSV/Excel metric data alongside text, CurioCat runs Granger causality tests against the LLM-inferred edges. Each edge is tagged as `confirmed` (statistical test agrees, p<0.05), `unsupported` (no significant relationship found), or `contradicted` (reverse direction is stronger). Confirmed edges receive an evidence score boost; unsupported/contradicted edges are penalised
+
 **Finalization:**
 
-7. **DAG Construction** — Builds a directed acyclic graph with cycle detection/breaking and weak-edge pruning
-8. **Belief Propagation** — Noisy-OR algorithm propagates beliefs along topological order, modulated by evidence quality. Computes uncertainty intervals via perturbation analysis
+8. **DAG Construction** — Builds a directed acyclic graph with cycle detection/breaking and weak-edge pruning
+9. **Belief Propagation** — Noisy-OR algorithm propagates beliefs along topological order, modulated by evidence quality. Computes uncertainty intervals via perturbation analysis
 
 ## Anti-Hallucination Pipeline
 
@@ -60,6 +64,7 @@ CurioCat is hardened against common LLM hallucination pathways with multiple val
 | **Discovery Verification** | New claims discovered from evidence snippets are web-verified before entering the graph — blocks circular inference |
 | **Claim Provenance** | Every claim stores the verbatim source sentence it was extracted from — full audit trail back to original text |
 | **Belief Intervals** | Perturbation-based uncertainty bands on every node — see how sensitive each belief is to input variations |
+| **Statistical Cross-Check** | When numeric data is available, Granger causality tests independently verify LLM-inferred edges. Confirmed edges are boosted; contradicted edges are penalised — LLM intuition meets statistical rigour |
 
 ## Architecture
 
@@ -79,10 +84,10 @@ CurioCat is hardened against common LLM hallucination pathways with multiple val
 ┌───────────────────┴─────────────────────────────────┐
 │  Backend (FastAPI + SQLAlchemy)                      │
 │  ┌──────────────────────────────────────────────┐   │
-│  │  5-Stage Pipeline Orchestrator               │   │
+│  │  Pipeline Orchestrator                        │   │
 │  │  ClaimExtractor → CausalInferrer →           │   │
-│  │  EvidenceGrounder → DAGBuilder →             │   │
-│  │  BeliefPropagation                           │   │
+│  │  EvidenceGrounder → StatisticalValidator →   │   │
+│  │  DAGBuilder → BeliefPropagation              │   │
 │  └──────────────────────────────────────────────┘   │
 │  ┌─────────┐  ┌───────────┐  ┌─────────────────┐   │
 │  │ LLM     │  │  Graph    │  │  Evidence        │   │
@@ -105,6 +110,7 @@ CurioCat is hardened against common LLM hallucination pathways with multiple val
 | LLM | OpenAI / Anthropic (switchable) |
 | Search | Brave Search API |
 | Graph | NetworkX, Noisy-OR belief propagation |
+| Statistics | SciPy (Granger causality, partial correlation, PC algorithm) |
 | Infra | Docker Compose, Alembic migrations |
 | Real-time | Server-Sent Events, WebSocket |
 
@@ -207,15 +213,38 @@ docker compose up --build
 
 This starts PostgreSQL + the backend API. You still need to run the frontend separately with `npm run dev` (see step 4).
 
+## Three-Layer Causal Analysis
+
+CurioCat also provides a standalone causal analysis mode (`/causal`) for quick, data-driven analysis:
+
+| Input | What Happens |
+|-------|-------------|
+| **Text** | LLM-only causal reasoning — instant hypotheses with confidence tiers |
+| **CSV/Excel** | Granger causality + PC algorithm (Layer 3) combined with LLM reasoning (Layer 1). Edges are tagged with statistical p-values and cross-validated |
+| **Screenshot** | Claude Vision extracts data from charts/dashboards, then runs the same statistical + LLM pipeline |
+
+Results show fused edges with four confidence tiers:
+
+| Tier | Visual | Meaning |
+|------|--------|---------|
+| **Confirmed** | ━━━━▶ solid thick green + glow | Statistically significant (p<0.05) and LLM agrees |
+| **Supported** | ────▶ solid blue | Multi-layer consensus |
+| **Hypothesis** | - - -▶ dashed amber | LLM inference only, no statistical data |
+| **Unverified** | · · ·▶ dotted grey | Insufficient evidence |
+
+Two view modes: **Conclusion** (default, for PMs — shows fused verdicts) and **Layer** (for analysts — side-by-side comparison of what statistics found vs what LLM inferred).
+
 ## Usage
 
 1. **Enter text** — Paste a scenario, article, or hypothesis (or pick a demo scenario)
 2. **Watch the pipeline** — Claims stream in live as the engine decomposes and traces causal chains
-3. **Explore the graph** — Interactive radial tree with zoom, click to expand/collapse nodes
+3. **Explore the graph** — Interactive force-directed graph with zoom, click to expand/collapse nodes
 4. **Inspect evidence** — Click edges to see supporting/contradicting evidence with source links
-5. **Stress-test assumptions** — Right-click edges to modify causal strength; beliefs re-propagate in real-time
-6. **Fork scenarios** — Create what-if branches, compare side-by-side or as overlay
-7. **Export** — Download as JSON, Markdown report, or interactive HTML
+5. **Check statistical validation** — Edges with numeric data show p-values and Granger test results alongside LLM evidence
+6. **Stress-test assumptions** — Right-click edges to modify causal strength; beliefs re-propagate in real-time
+7. **Fork scenarios** — Create what-if branches, compare side-by-side or as overlay
+8. **Quick causal analysis** — Use the `/causal` page to upload CSV or screenshots for instant three-layer analysis
+9. **Export** — Download as JSON, Markdown report, or interactive HTML
 
 ## Project Structure
 
@@ -231,17 +260,19 @@ curiocat/
 │   ├── prompts/         # Structured prompts (claim extraction, causal inference, evidence, bias, discovery, strategic advisor)
 │   ├── client.py        # LLM client abstraction (OpenAI/Anthropic)
 │   └── embeddings.py    # Embedding generation
-├── pipeline/            # Orchestrator + stages: extract → infer → ground → build → propagate, bias audit, discovery
+├── statistical/         # Granger causality, PC algorithm (CPU-based, no GPU required)
+├── pipeline/            # Orchestrator + stages: extract → infer → ground → validate → build → propagate, bias audit, discovery
 ├── config.py            # Pydantic Settings
 ├── exceptions.py        # Custom error classes
 └── main.py              # FastAPI app entry point
 
 frontend/src/
 ├── components/
-│   ├── input/           # InputScreen, DemoScenarios
+│   ├── input/           # InputScreen, DemoScenarios, CausalAnalysisScreen
 │   ├── processing/      # ProcessingScreen, PipelineStream, ClaimStream, EdgeStream, EvidenceStream, StageTimeline
 │   ├── tree/            # ForceGraph, GraphScreen, GraphListScreen, EvidencePanel, NodeDetailPanel, EdgeBundlePanel,
-│   │                    # ClaimsBrowser, MiniMap, GraphTooltip, StrategicAdvisorPanel, TimelineView, TimeScrubber
+│   │                    # ClaimsBrowser, MiniMap, GraphTooltip, StrategicAdvisorPanel, TimelineView, TimeScrubber,
+│   │                    # CausalAnalysisGraph (three-layer visualization)
 │   ├── scenario/        # ScenarioForge, ComparisonView, MergeOverlay
 │   ├── export/          # ExportPanel
 │   ├── layout/          # AppLayout

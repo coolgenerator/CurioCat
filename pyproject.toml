@@ -12,6 +12,7 @@ dependencies = [
     "pgvector",
     "networkx",
     "numpy",
+    "scipy",
     "openai",
     "anthropic",
     "httpx",
@@ -22,6 +23,9 @@ dependencies = [
     "python-dotenv",
     "python-multipart",
     "pypdf",
+    "ddgs",
+    "transformers",
+    "torch",
 ]
 
 [project.optional-dependencies]

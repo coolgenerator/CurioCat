@@ -52,7 +52,9 @@ class LLMClient(ABC):
             **kwargs: Additional provider-specific parameters.
 
         Returns:
-            A parsed dict matching the provided schema.
+            A parsed dict matching the provided schema. If logprobs are
+            available, a ``_logprob_confidence`` key (float, 0-1) is
+            added to the dict.
         """
         ...
 
@@ -60,8 +62,12 @@ class LLMClient(ABC):
 class OpenAIClient(LLMClient):
     """LLM client backed by the OpenAI Chat Completions API."""
 
-    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
-        self._client = openai.AsyncOpenAI(api_key=api_key or settings.openai_api_key)
+    def __init__(self, api_key: str | None = None, model: str | None = None, base_url: str | None = None) -> None:
+        kwargs: dict[str, Any] = {"api_key": api_key or settings.openai_api_key}
+        url = base_url or settings.openai_base_url
+        if url:
+            kwargs["base_url"] = url
+        self._client = openai.AsyncOpenAI(**kwargs)
         self._model = model or settings.llm_model
 
     @retry(
@@ -124,11 +130,27 @@ class OpenAIClient(LLMClient):
                 },
                 temperature=kwargs.get("temperature", 0.2),
                 max_tokens=kwargs.get("max_tokens", 4096),
+                logprobs=True,
             )
             content = response.choices[0].message.content
             if content is None:
                 raise LLMError("OpenAI returned empty response content")
-            return json.loads(content)
+            result = json.loads(content)
+
+            # Compute confidence from token logprobs (geometric mean)
+            logprob_content = response.choices[0].logprobs
+            if logprob_content and logprob_content.content:
+                import math
+                token_logprobs = [
+                    t.logprob for t in logprob_content.content
+                    if t.logprob is not None
+                ]
+                if token_logprobs:
+                    # Geometric mean of token probabilities
+                    avg_logprob = sum(token_logprobs) / len(token_logprobs)
+                    result["_logprob_confidence"] = round(math.exp(avg_logprob), 4)
+
+            return result
         except json.JSONDecodeError as exc:
             raise LLMError(f"Failed to parse OpenAI JSON response: {exc}") from exc
         except (
@@ -237,8 +259,12 @@ class AnthropicClient(LLMClient):
             raise LLMError(f"Anthropic API error: {exc}") from exc
 
 
-def get_llm_client() -> LLMClient:
+def get_llm_client(*, enable_cache: bool = True) -> LLMClient:
     """Factory function that returns the appropriate LLM client based on settings.
+
+    Args:
+        enable_cache: If True (default), wraps the client with a semantic
+            cache that avoids redundant LLM calls for similar prompts.
 
     Returns:
         An LLMClient instance configured according to ``settings.llm_provider``.
@@ -248,8 +274,18 @@ def get_llm_client() -> LLMClient:
     """
     provider = settings.llm_provider.lower()
     if provider == "openai":
-        return OpenAIClient()
+        inner: LLMClient = OpenAIClient()
     elif provider == "anthropic":
-        return AnthropicClient()
+        inner = AnthropicClient()
     else:
         raise LLMError(f"Unsupported LLM provider: {provider}")
+
+    if enable_cache:
+        from curiocat.llm.cache import CachedLLMClient, SemanticCache
+        from curiocat.llm.embeddings import EmbeddingService
+
+        embed_svc = EmbeddingService()
+        cache = SemanticCache(embed_fn=embed_svc.embed)
+        return CachedLLMClient(inner=inner, cache=cache)
+
+    return inner

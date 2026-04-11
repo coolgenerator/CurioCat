@@ -48,6 +48,7 @@ export interface CausalEdge {
   biasWarnings: BiasWarning[]
   consensusLevel: string
   sensitivity: number | null
+  isFeedback: boolean
   evidences: Evidence[]
 }
 

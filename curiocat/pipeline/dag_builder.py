@@ -30,7 +30,7 @@ class DAGBuilder:
         self,
         claims: list[dict[str, Any]],
         edges: list[dict[str, Any]],
-    ) -> tuple[nx.DiGraph, dict[str, str]]:
+    ) -> tuple[nx.DiGraph, dict[str, str], list[tuple[str, str]]]:
         """Build a DAG from extracted claims and inferred causal edges.
 
         Pipeline:
@@ -39,7 +39,7 @@ class DAGBuilder:
         3. Break cycles at the weakest edge (lowest strength * evidence_score).
         4. Prune edges with strength < 0.1.
         5. Determine logic gates for multi-parent nodes.
-        6. Return a clean DAG and logic gate map.
+        6. Return a clean DAG, logic gate map, and feedback edges.
 
         Args:
             claims: List of claim dicts with text, type, confidence,
@@ -48,8 +48,10 @@ class DAGBuilder:
                 mechanism, strength, evidence_score, etc.
 
         Returns:
-            A tuple of (networkx DiGraph, logic_gate_map) where
-            logic_gate_map maps node_id -> "or" | "and".
+            A tuple of (networkx DiGraph, logic_gate_map, feedback_edges)
+            where logic_gate_map maps node_id -> "or" | "and" and
+            feedback_edges is a list of (source_id, target_id) tuples
+            that were removed to break cycles.
 
         Raises:
             DAGError: If graph construction fails irrecoverably.
@@ -110,7 +112,7 @@ class DAGBuilder:
             graph.remove_edges_from(edges_to_remove)
 
         # Break cycles
-        graph = self._break_cycles(graph)
+        graph, feedback_edges = self._break_cycles(graph)
 
         # Determine logic gates for multi-parent nodes
         logic_gate_map = self._determine_logic_gates(graph)
@@ -125,9 +127,9 @@ class DAGBuilder:
             graph.number_of_edges(),
         )
 
-        return graph, logic_gate_map
+        return graph, logic_gate_map, feedback_edges
 
-    def _break_cycles(self, graph: nx.DiGraph) -> nx.DiGraph:
+    def _break_cycles(self, graph: nx.DiGraph) -> tuple[nx.DiGraph, list[tuple[str, str]]]:
         """Detect and break cycles by removing the weakest edge in each cycle.
 
         Iteratively finds cycles and removes the edge with the lowest
@@ -137,8 +139,10 @@ class DAGBuilder:
             graph: The directed graph, potentially containing cycles.
 
         Returns:
-            The modified graph with all cycles broken.
+            A tuple of (modified graph, feedback_edges) where feedback_edges
+            is the list of (source, target) edges removed to break cycles.
         """
+        feedback_edges: list[tuple[str, str]] = []
         max_iterations = graph.number_of_edges()
         iteration = 0
 
@@ -176,10 +180,11 @@ class DAGBuilder:
                     weakest_edge[1],
                     weakest_score,
                 )
+                feedback_edges.append(weakest_edge)
                 graph.remove_edge(*weakest_edge)
                 iteration += 1
 
-        return graph
+        return graph, feedback_edges
 
     @staticmethod
     def _determine_logic_gates(graph: nx.DiGraph) -> dict[str, str]:
