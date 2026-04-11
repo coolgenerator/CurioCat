@@ -5,6 +5,11 @@
 
 import type { CausalType, ConditionType, LogicGate } from '../types/graph.ts'
 
+// --- Feedback edge visual style ---
+
+export const FEEDBACK_EDGE_DASH = '4 2 1 2'
+export const FEEDBACK_EDGE_COLOR = '#a855f7'
+
 // --- Edge dash patterns by causal type ---
 
 export const EDGE_DASH: Record<CausalType, string> = {

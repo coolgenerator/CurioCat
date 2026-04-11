@@ -13,6 +13,7 @@ export const zh: Translations = {
     compare: '对比',
     history: '历史记录',
     reports: '报告',
+    causalAnalysis: '因果分析',
   },
   input: {
     titlePlaceholder: '为你的分析起个标题...',

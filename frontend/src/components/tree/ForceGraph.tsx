@@ -5,7 +5,7 @@ import { drag } from 'd3-drag'
 import { scaleLinear } from 'd3-scale'
 import 'd3-transition'
 import type { BeliefChange, CausalGraph, CausalType, ClaimType, PathInfo, ViewMode } from '../../types/graph.ts'
-import { EDGE_DASH, edgeStrokeWidth } from '../../lib/visualConstants.ts'
+import { EDGE_DASH, FEEDBACK_EDGE_DASH, FEEDBACK_EDGE_COLOR, edgeStrokeWidth } from '../../lib/visualConstants.ts'
 import {
   useForceLayout,
   CONVERGENCE_SCALE,
@@ -469,6 +469,7 @@ export default function ForceGraph({
       .attr('d', (d) => bezierPath(d.source.x, d.source.y, d.target.x, d.target.y))
       .attr('fill', 'none')
       .attr('stroke', (d) => {
+        if (d.primaryEdge.isFeedback) return FEEDBACK_EDGE_COLOR
         const edgeKey = `${d.source.id}->${d.target.id}`
         if (activePathEdgeSet.has(edgeKey)) return activePathColor
         if (isFocus && (!isFocusVisible(d.source.id) || !isFocusVisible(d.target.id))) return theme.edgeDimmed
@@ -491,6 +492,7 @@ export default function ForceGraph({
         return 0.7
       })
       .attr('stroke-dasharray', (d) => {
+        if (d.primaryEdge.isFeedback) return FEEDBACK_EDGE_DASH
         const causalType = (d.primaryEdge.causalType ?? 'direct') as CausalType
         return EDGE_DASH[causalType] || 'none'
       })
@@ -573,6 +575,7 @@ export default function ForceGraph({
       svg.selectAll<SVGPathElement, ForceLink>('path.edge-line')
         .transition().duration(duration)
         .attr('stroke', (link) => {
+          if (link.primaryEdge.isFeedback) return FEEDBACK_EDGE_COLOR
           const edgeKey = `${link.source.id}->${link.target.id}`
           if (activePathEdgeSet.has(edgeKey)) return activePathColor
           const bothVisible = !isFocus || (isFocusVisible(link.source.id) && isFocusVisible(link.target.id))
@@ -1191,8 +1194,10 @@ export default function ForceGraph({
       const base = edgeStrokeWidth(d.maxStrength)
       const bothVisible = !isFocusLocal || (isFocusVisibleLocal(d.source.id) && isFocusVisibleLocal(d.target.id))
 
+      const strokeColor = d.primaryEdge.isFeedback ? FEEDBACK_EDGE_COLOR
+        : bothVisible ? edgeColor(d.maxEvidenceScore) : themeLocal.edgeDimmed
       path
-        .attr('stroke', bothVisible ? edgeColor(d.maxEvidenceScore) : themeLocal.edgeDimmed)
+        .attr('stroke', strokeColor)
         .attr('stroke-width', isSelected ? base + 2 : base)
         .attr('stroke-opacity', isSelected ? 1 : edgeOpacity(d))
     })

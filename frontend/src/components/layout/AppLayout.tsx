@@ -1,6 +1,6 @@
 import { useMemo, type ReactNode } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { Home, GitBranch, Clock, FileText, Sun, Moon, Github } from 'lucide-react'
+import { Home, GitBranch, Clock, FileText, Sun, Moon, Github, FlaskConical } from 'lucide-react'
 import { useAnalysis } from '../../context/AnalysisContext'
 import { useT, LanguageToggle } from '../../i18n/index.tsx'
 import { useTheme } from '../../hooks/useTheme.ts'
@@ -27,6 +27,7 @@ export default function AppLayout({ children }: AppLayoutProps) {
     { path: projectId ? `/graph/${projectId}` : '/graph', label: t.nav.graph, icon: GitBranch, enabled: true },
     { path: '/history', label: t.nav.history, icon: Clock, enabled: true },
     { path: '/reports', label: t.nav.reports, icon: FileText, enabled: true },
+    { path: '/causal', label: t.nav.causalAnalysis, icon: FlaskConical, enabled: true },
   ]
 
   return (

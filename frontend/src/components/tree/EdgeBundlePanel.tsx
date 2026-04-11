@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { X, ArrowLeft, ChevronDown, ChevronUp, ExternalLink, Clock, AlertTriangle } from 'lucide-react'
+import { X, ArrowLeft, ChevronDown, ChevronUp, ExternalLink, Clock, AlertTriangle, RefreshCw } from 'lucide-react'
 import type { CausalGraph, CausalEdge } from '../../types/graph.ts'
 import { useT } from '../../i18n/index.tsx'
 import { CAUSAL_TYPE_META } from '../../lib/visualConstants.ts'
@@ -143,6 +143,11 @@ function EdgeCard({
         className="w-full flex items-center gap-2 px-3 py-2.5 text-left hover:bg-surface-700/80 transition-colors"
       >
         <span className="text-sm shrink-0">{meta?.icon}</span>
+        {edge.isFeedback && (
+          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-purple-500/15 text-[9px] text-purple-400 border border-purple-500/20 shrink-0">
+            <RefreshCw className="w-2.5 h-2.5" /> Feedback
+          </span>
+        )}
         <span className="text-xs text-text-primary truncate flex-1">
           {edge.mechanism || meta?.label || ct}
         </span>
@@ -159,6 +164,16 @@ function EdgeCard({
       {/* Expanded detail */}
       {expanded && (
         <div className="px-3 pb-3 space-y-3 border-t border-surface-600 pt-3">
+          {/* Feedback edge notice */}
+          {edge.isFeedback && (
+            <div className="flex items-start gap-1.5 px-2 py-1.5 rounded-md bg-purple-500/10 border border-purple-500/20">
+              <RefreshCw className="w-3 h-3 text-purple-400 mt-0.5 shrink-0" />
+              <span className="text-[10px] text-purple-300">
+                {t.bundledEdge?.feedbackNotice ?? 'This edge forms a feedback loop and is excluded from belief propagation, but represents a real causal relationship.'}
+              </span>
+            </div>
+          )}
+
           {/* Mechanism */}
           {edge.mechanism && (
             <ExpandableText

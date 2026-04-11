@@ -49,6 +49,7 @@ export function transformApiGraph(api: Record<string, unknown>): CausalGraph {
     decayType: (e.decay_type as string) ?? 'none',
     biasWarnings: (e.bias_warnings as Array<{ type: string; explanation: string; severity: 'low' | 'medium' | 'high' }>) ?? [],
     consensusLevel: (e.consensus_level as string) ?? 'insufficient',
+    isFeedback: (e.is_feedback as boolean) ?? false,
     evidences: ((e.evidences as Array<Record<string, unknown>>) ?? []).map((ev) => ({
       id: ev.id as string,
       evidenceType: ev.evidence_type as 'supporting' | 'contradicting',

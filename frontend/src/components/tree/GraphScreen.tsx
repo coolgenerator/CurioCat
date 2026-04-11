@@ -72,6 +72,7 @@ interface ApiEdge {
   bias_warnings?: Array<{ type: string; explanation: string; severity: string }>
   consensus_level?: string
   sensitivity: number | null
+  is_feedback?: boolean
   evidences: ApiEvidence[]
 }
 
@@ -132,6 +133,7 @@ function transformEdge(api: ApiEdge): CausalEdge {
     biasWarnings: (api.bias_warnings ?? []) as CausalEdge['biasWarnings'],
     consensusLevel: api.consensus_level ?? 'insufficient',
     sensitivity: api.sensitivity,
+    isFeedback: api.is_feedback ?? false,
     evidences: api.evidences.map(transformEvidence),
   }
 }
@@ -210,11 +212,9 @@ export default function GraphScreen() {
     }
   }, [projectId, state.projectId, dispatch])
 
-  // Fetch graph data
+  // Fetch graph data — initial load
   useEffect(() => {
     if (!projectId) return
-
-    // If graph is already loaded for this project, skip
     if (graph && graph.projectId === projectId) return
 
     let cancelled = false
@@ -241,6 +241,57 @@ export default function GraphScreen() {
     void fetchGraph()
     return () => { cancelled = true }
   }, [projectId, graph, dispatch, t])
+
+  // SSE-driven graph refresh: listen for pipeline stage completions and
+  // re-fetch the graph when new data is available. Much more efficient
+  // than polling — zero requests when nothing changes, instant updates
+  // when a stage completes.
+  useEffect(() => {
+    if (!projectId) return
+
+    let cancelled = false
+    let eventSource: EventSource | null = null
+
+    async function refreshGraph() {
+      if (cancelled) return
+      try {
+        const apiGraph = await apiGet<ApiGraph>(`/api/v1/graph/${projectId}`)
+        if (cancelled) return
+        const causalGraph = transformGraph(apiGraph)
+        dispatch({ type: 'SET_GRAPH', graph: causalGraph })
+      } catch {
+        // Silently ignore — graph will be refreshed on next event
+      }
+    }
+
+    try {
+      eventSource = new EventSource(`/api/v1/analyze/${projectId}/stream`)
+
+      // Listen for graph_updated — fired each time the backend commits
+      // new claims, edges, or analysis results to the database.
+      eventSource.addEventListener('graph_updated', () => {
+        void refreshGraph()
+      })
+
+      // Pipeline completion — final refresh
+      eventSource.addEventListener('complete', () => {
+        void refreshGraph()
+        eventSource?.close()
+      })
+
+      eventSource.onerror = () => {
+        void refreshGraph()
+        eventSource?.close()
+      }
+    } catch {
+      // SSE not available — silent fallback, initial fetch is enough
+    }
+
+    return () => {
+      cancelled = true
+      eventSource?.close()
+    }
+  }, [projectId, dispatch])
 
   // Reset active path index when focus paths change
   useEffect(() => {

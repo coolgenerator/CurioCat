@@ -11,6 +11,7 @@ export const en = {
     compare: 'Compare',
     history: 'History',
     reports: 'Reports',
+    causalAnalysis: 'Causal Analysis',
   },
   input: {
     titlePlaceholder: 'Give your analysis a title...',
