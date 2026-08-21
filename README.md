@@ -1,3 +1,5 @@
+
+
 [**中文**](./README.zh-CN.md) | English
 
 <p align="center">
@@ -211,7 +213,7 @@ To run the database and backend together in Docker:
 docker compose up --build
 ```
 
-This starts PostgreSQL + the backend API. You still need to run the frontend separately with `npm run dev` (see step 4).
+This starts PostgreSQL + the backend API. When running the backend in Docker, set `DATABASE_URL` to use the `postgres` service host (e.g. `postgresql+asyncpg://curiocat:curiocat@postgres:5432/curiocat`) instead of `localhost`. You still need to run the frontend separately with `npm run dev` (see step 4).
 
 ## Three-Layer Causal Analysis
 
